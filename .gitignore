@@ -1,0 +1,58 @@
+# Python 缓存与测试产物
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# 虚拟环境与本机环境变量
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# 构建与打包产物
+build/
+dist/
+*.egg-info/
+*.egg
+
+# 程序运行产物
+.runtime/*
+!.runtime/.gitkeep
+
+logs/*
+!logs/.gitkeep
+*.log
+
+# 本地截图不推送到远程仓库
+screenshots/
+
+# 编辑器、IDE 与本机助手配置
+.vscode/
+.idea/
+.vs/
+.agents/
+.codex/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 临时文件与编辑器备份
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
