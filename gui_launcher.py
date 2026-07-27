@@ -15,7 +15,7 @@ try:
         DEFAULT_CAPTURE_METHOD,
         DEFAULT_CLICK_METHOD,
         DEFAULT_ENABLE_RESOURCE_SALE,
-        DEFAULT_NO_FORCE_CLIENT_SIZE,
+        DEFAULT_FORCE_CLIENT_SIZE,
         DEFAULT_TOOLBOX_WINDOW_TITLE,
         DEFAULT_WINDOW_TITLE,
         TARGET_CLIENT_WIDTH,
@@ -30,7 +30,7 @@ except Exception:
     DEFAULT_CAPTURE_METHOD = "printwindow"
     DEFAULT_CLICK_METHOD = "message"
     DEFAULT_ENABLE_RESOURCE_SALE = False
-    DEFAULT_NO_FORCE_CLIENT_SIZE = False
+    DEFAULT_FORCE_CLIENT_SIZE = True
     DEFAULT_TOOLBOX_WINDOW_TITLE = "Yang昜工具箱"
     DEFAULT_WINDOW_TITLE = "雷霆战机：集结"
     TARGET_CLIENT_WIDTH = 720
@@ -147,7 +147,7 @@ class App(tk.Tk):
         self.window_title = tk.StringVar(value=DEFAULT_WINDOW_TITLE)
         self.capture_method = tk.StringVar(value=DEFAULT_CAPTURE_METHOD)
         self.click_method = tk.StringVar(value=DEFAULT_CLICK_METHOD)
-        self.no_force_client_size = tk.BooleanVar(value=DEFAULT_NO_FORCE_CLIENT_SIZE)
+        self.force_client_size = tk.BooleanVar(value=DEFAULT_FORCE_CLIENT_SIZE)
         self.client_width = tk.IntVar(value=TARGET_CLIENT_WIDTH)
         self.client_height = tk.IntVar(value=TARGET_CLIENT_HEIGHT)
         self.toolbox_client_width = tk.IntVar(value=TOOLBOX_CLIENT_WIDTH)
@@ -275,8 +275,8 @@ class App(tk.Tk):
 
         ttk.Checkbutton(
             settings_frame,
-            text="不强制调整尺寸",
-            variable=self.no_force_client_size,
+            text="强制调整尺寸",
+            variable=self.force_client_size,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
             settings_frame,
@@ -398,7 +398,7 @@ class App(tk.Tk):
     def base_args(self) -> list[str]:
         args = ["--capture-method", self.capture_method.get()]
         args += ["--click-method", self.click_method.get()]
-        if self.no_force_client_size.get():
+        if not self.force_client_size.get():
             args.append("--no-force-client-size")
         args += ["--client-width", str(int(self.client_width.get()))]
         args += ["--client-height", str(int(self.client_height.get()))]
@@ -451,7 +451,7 @@ class App(tk.Tk):
             "--client-height", str(client_height),
             "--out", str(out),
         ]
-        if self.no_force_client_size.get():
+        if not self.force_client_size.get():
             cmd.append("--no-force-client-size")
         self.run(cmd)
 
@@ -477,7 +477,7 @@ class App(tk.Tk):
             "--x", str(float(self.click_x.get())),
             "--y", str(float(self.click_y.get())),
         ]
-        if self.no_force_client_size.get():
+        if not self.force_client_size.get():
             cmd.append("--no-force-client-size")
         self.run(cmd)
 
@@ -498,7 +498,7 @@ class App(tk.Tk):
             "--press-delay", str(float(self.swipe_press_delay.get())),
             "--release-delay", str(float(self.swipe_release_delay.get())),
         ]
-        if self.no_force_client_size.get():
+        if not self.force_client_size.get():
             cmd.append("--no-force-client-size")
         self.run(cmd)
 

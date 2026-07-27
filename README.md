@@ -1,332 +1,260 @@
-# 雷霆战机：集结 - 电脑端微信窗口日活脚本
+# 《雷霆战机：集结》日活挂机脚本
 
-本版本已经去掉 ADB / 模拟器控制层，改为直接控制 **主机 Windows 上的电脑端微信小程序窗口**。
+这是一个面向 Windows 电脑端微信小程序《雷霆战机：集结》的本地自动化工具。它通过窗口截图、OpenCV 模板识别和 Windows 输入控制，自动完成常见日活、奖励领取、关卡扫荡及部分战斗流程。
 
-核心流程仍然复用模拟器版的 `runner.py` 业务逻辑：
+项目提供图形界面，可自由选择本次执行的模块、查看实时日志，并在首次使用或游戏界面变化时测试截图、点击、滑动和模板识别。
+
+> 本项目不是游戏官方工具。微信版本、游戏界面、账号进度和电脑环境不同，都可能影响识别与操作结果。建议第一次运行时全程观察。
+
+## 主要功能
+
+- 自动执行常见日活流程，并按照固定顺序衔接各模块。
+- 支持兑换码、微信游戏圈、商城、体力、战队、夺宝和日常奖励领取。
+- 支持活动关卡、普通/英雄关卡扫荡、BOSS 模式及无尽模式。
+- 支持背包装备合成、拆分和经验合成。
+- 提供可选的残骸资源出售功能，默认关闭，避免误售。
+- 自动调整并检查微信小程序窗口尺寸，保证模板与点击坐标一致。
+- 支持后台消息点击，也可切换为前台真实鼠标操作。
+- 提供 GUI 日志、窗口调试、截图、点击、滑动和模板匹配工具。
+
+## 运行环境
+
+- Windows 10/11
+- 电脑端微信
+- Python 3.10 或更高版本（建议安装时勾选 `Add Python to PATH`）
+- 《雷霆战机：集结》微信小程序窗口
+- `Yang昜工具箱` 窗口，仅在使用“兑换码”模块时需要
+
+程序默认精确查找以下窗口标题：
 
 ```text
-星际探索领取
-商城礼包领取
-战队征讨与捐献
-体力获取
+雷霆战机：集结
+Yang昜工具箱
 ```
 
-但底层控制方式已经替换为：
+游戏窗口目标客户区为 `720 × 1280`，工具箱目标客户区为 `414 × 780`。程序默认会自动调整并校验尺寸，请勿在运行过程中手动拖动窗口大小。
 
-```text
-Windows 窗口客户区截图 → OpenCV 模板匹配 → Windows 窗口坐标点击
+## 快速开始
+
+### 1. 获取项目
+
+使用 Git：
+
+```powershell
+git clone https://github.com/PigeonGO2004/lei-ting-zhan-ji-daily-auto.git
+cd lei-ting-zhan-ji-daily-auto
 ```
 
+也可以直接在 GitHub 下载 ZIP，解压后进入项目目录。
 
----
+### 2. 安装依赖
 
-## 0. 图形界面启动器（推荐）
-
-如果不想每次手动输入命令，可以直接双击：
-
-```text
-start_gui.bat
-```
-
-首次使用前先双击安装依赖：
+最简单的方式是双击：
 
 ```text
 install_deps.bat
 ```
 
-GUI 默认显示“一键运行”“执行模块”和输出日志。勾选所需模块后，直接点击“一键运行”区域中的“运行选中模块”即可。
+也可以在 PowerShell 中安装：
 
-首次调试时勾选“显示更多功能”，再按顺序操作：
+```powershell
+python -m pip install -r requirements.txt
+```
+
+如果希望使用独立虚拟环境：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+`start_gui.bat` 检测到 `.venv` 后会优先使用其中的 Python。
+
+### 3. 准备游戏窗口
+
+1. 登录电脑端微信。
+2. 打开《雷霆战机：集结》，让它成为一个独立的小程序窗口。
+3. 如果要执行兑换码模块，同时打开 `Yang昜工具箱`。
+4. 第一次运行时不要完全遮挡游戏窗口，以便观察识别和点击是否正常。
+
+### 4. 启动图形界面
+
+双击：
 
 ```text
-1. 列出窗口：确认窗口标题是否是“雷霆战机：集结”
-2. 刷新窗口状态：置前窗口，并通过 resize nudge 恢复 client rect 到 720×1280
-3. 截图保存：确认截图是否是小程序游戏画面
-4. 测试点击：确认 message 或 foreground 点击是否有效
-5. 测试滑动：确认列表拖拽是否有效
-6. 取消“显示更多功能”，返回日常运行界面
+start_gui.bat
 ```
 
-GUI 启动器文件：
+在“执行模块”中勾选本次需要完成的内容，然后点击“运行选中模块”。运行日志会直接显示在窗口下方。
+
+“背包空间处理（资源出售）”默认不启用。只有确认 `config.py` 中的出售范围符合自己的需求后，才应勾选该选项。
+
+## 可用模块
+
+| 模块 | 标识 | 功能 |
+| --- | --- | --- |
+| 兑换码 | `redemption_code` | 从 `Yang昜工具箱` 获取兑换码并在游戏内兑换 |
+| 微信游戏圈 | `game_circle` | 处理游戏圈互动、礼包及相关社区奖励 |
+| 十年集结 | `decade_reunion` | 领取十年集结相关奖励 |
+| 商城 | `shop` | 领取商城中的免费资源和免费礼包 |
+| 星际探索 | `interstellar` | 领取星际探索相关资源 |
+| 体力获取 | `stamina` | 领取免费体力及好友体力 |
+| 战队 | `team` | 处理战队征讨、奖励和捐献 |
+| 背包空间处理 | `backpack` | 进行装备合成、拆分、经验合成及可选资源出售 |
+| 夺宝 | `treasure_hunt` | 领取和使用可用的免费夺宝机会 |
+| 活动关卡 | `event_stage` | 执行当前配置的活动关卡流程 |
+| 关卡扫荡 | `level_sweep` | 按配置扫荡普通和英雄关卡，并处理相关奖励 |
+| BOSS 模式 | `boss_mode` | 根据当天日期选择板块并执行 BOSS 模式 |
+| 无尽模式 | `endless_mode` | 执行无尽模式世界竞赛及奖励领取 |
+| 日常奖励 | `daily_rewards` | 领取活跃度和首页可领取奖励 |
+
+勾选多个模块时，程序始终按内置日活顺序执行，不受勾选顺序影响。完整流程中背包处理会在不同阶段多次运行，以及时释放空间；残骸出售仍受单独开关控制。
+
+## 首次运行建议
+
+默认运行方式是：
 
 ```text
-gui_launcher.py       # Tkinter 图形界面
-start_gui.bat         # 双击启动 GUI
-install_deps.bat      # 双击安装 requirements.txt 中的依赖
-run_all_default.bat   # 使用默认参数直接运行全部模块
+截图：printwindow
+点击：message
 ```
 
-其中 `message` 点击模式尽量不移动真实鼠标，但电脑端微信小游戏不一定响应；如果测试无效，再切换为 `foreground`。
+这种组合会尽量在后台截图和点击，不移动真实鼠标。但电脑端微信使用 Chromium 渲染，不同版本对后台截图和输入的支持可能不同。
 
-## 1. 安装依赖
+第一次使用时，可以勾选 GUI 中的“显示更多功能”，依次检查：
 
-建议在 Windows 的 Python 环境中安装：
+1. “列出窗口”能否找到正确窗口。
+2. “刷新窗口状态”能否恢复目标尺寸。
+3. “截图保存”得到的是否为当前游戏画面。
+4. “测试点击”和“测试滑动”是否能让游戏响应。
+5. “模板匹配调试”是否能识别当前界面按钮。
 
-```bash
-pip install -r requirements.txt
+遇到问题时可按下表调整：
+
+| 现象 | 建议 |
+| --- | --- |
+| 截图黑屏、停留在旧画面或内容不完整 | 改用 `mss`，并保持游戏窗口可见且不被遮挡 |
+| 后台点击没有反应 | 改用 `foreground` |
+| 窗口被遮挡后不再响应 | 使用“刷新窗口状态”，并避免完全遮挡窗口 |
+| 大量模板无法识别 | 检查窗口尺寸；游戏更新后可能需要重新制作模板 |
+
+使用 `foreground` 时，程序会激活游戏窗口并移动真实鼠标，运行期间不要同时操作鼠标和键盘。
+
+## 常用配置
+
+日常使用通常只需要修改项目根目录的 `config.py`：
+
+### 关卡扫荡计划
+
+`LEVEL_SWEEP_PLAN` 控制普通和英雄关卡的扫荡内容：
+
+```python
+{"level": 128, "sweeps": 2, "double_rewards": 2}
 ```
 
-依赖包括：
+- `level`：关卡编号
+- `sweeps`：扫荡次数
+- `double_rewards`：其中前几次领取广告双倍奖励
 
-```text
-opencv-python：模板匹配
-numpy：OpenCV数组处理
-Pillow：截图保存和图像处理
-mss：窗口客户区截图备用方案
-pyautogui：前台真实点击模式
-pywin32：窗口枚举、PrintWindow截图、后台消息点击
+请根据自己的关卡进度、体力和每日需求调整。
+
+### 残骸资源出售
+
+`RESOURCE_SALE_WRECKS` 控制各类残骸是否允许出售：
+
+```python
+"boss_wreck_lv1": True
 ```
 
----
+- `True`：允许出售
+- `False`：保留
 
-## 2. 先确认微信窗口标题
+配置为 `True` 并不会自动出售；还必须在 GUI 中勾选“资源出售”，或在命令行添加 `--enable-resource-sale`。首次使用前务必逐项检查，资源出售造成的物品消耗无法由脚本撤销。
 
-打开电脑端微信和《雷霆战机：集结》小程序窗口。只有执行兑换码模块时才需要额外打开 `Yang昜工具箱`；未选择兑换码模块时不会查找或创建工具箱控制器。兑换码流程要求游戏窗口客户区默认为 720×1280，工具箱窗口客户区默认为 414×780；默认会自动调整，也可分别通过 `--client-width/height` 和 `--toolbox-client-width/height` 覆盖。
+### 模板与坐标
 
-然后运行：
+`templates/`、`TEMPLATE_SPECS` 和固定坐标均基于目标窗口尺寸。只有在游戏界面更新、模板失效或主动更改窗口尺寸时，才需要调整这些内容。
 
-```bash
-python tools/window_probe.py --keyword 微信
-```
+仓库内模板基于当前项目环境制作，不保证适用于所有微信版本、显示环境或游戏版本。
 
-或者：
+## 命令行使用
 
-```bash
-python tools/window_probe.py --keyword 雷霆
-```
+推荐普通用户使用 GUI。需要脚本化运行时，可以直接执行：
 
-它会列出匹配窗口，例如：
-
-```text
-hwnd        : 123456
-title       : '雷霆战机：集结'
-class       : Chrome_WidgetWin_0
-client rect : (100, 80, 820, 1360), size=720x1280
-```
-
-主程序固定精确匹配 `config.py` 中的 `DEFAULT_WINDOW_TITLE`；辅助工具仍可通过 `--window-title` 指定窗口。如果只想按关键词查找窗口，请使用 `tools/window_probe.py`。
-
----
-
-## 3. 运行脚本
-
-默认精确查找标题为“雷霆战机：集结”的窗口：
-
-```bash
+```powershell
 python main.py
 ```
 
-只运行某个模块：
+只运行部分模块：
 
-```bash
-python main.py --sections redemption_code
-python main.py --sections game_circle
-python main.py --sections decade_reunion
-python main.py --sections shop
-python main.py --sections interstellar
-python main.py --sections stamina
-python main.py --sections team
-python main.py --sections backpack
-python main.py --sections treasure_hunt
-python main.py --sections event_stage
-python main.py --sections level_sweep
-python main.py --sections boss_mode
-python main.py --sections endless_mode
-python main.py --sections daily_rewards
+```powershell
+python main.py --sections shop,stamina,daily_rewards
 ```
 
-运行多个模块：
+使用可见窗口截图和真实点击：
 
-```bash
-python main.py --sections redemption_code,game_circle,decade_reunion,shop,interstellar,stamina,team,backpack,treasure_hunt,event_stage,level_sweep,boss_mode,endless_mode,daily_rewards
+```powershell
+python main.py --capture-method mss --click-method foreground
 ```
 
-模块的执行顺序由 Runner 固定，不取决于 `--sections` 参数中的书写顺序。完整流程中 `backpack` 会执行三次：第一次完成装备合成与拆分、资源出售和经验合成；第二次仅在启用资源出售时再次出售；第三次只执行装备合成与拆分。残骸出售涉及物品消耗，需要额外传 `--enable-resource-sale` 或在 GUI 的“背包空间处理（资源出售）”中勾选；具体出售范围由 `config.py` 的 `RESOURCE_SALE_WRECKS` 统一配置。
+启用残骸资源出售：
 
-`redemption_code` 是完整流程的第一项：进入 `Yang昜工具箱` 的雷霆兑换码列表，通过“关闭”按钮判断兑换码详情已经打开，点击兑换码文本使其选中后以 `Ctrl+C` 复制，再将识别出的兑换码输入游戏设置的兑换弹窗并领取奖励。若兑换后出现通用确认弹窗，表示兑换码无效或已经使用，程序会关闭提示，并只在输入下一条兑换码前清空上一次残留内容。列表清空后关闭工具箱窗口，并退出游戏兑换与设置弹窗。
-
-`game_circle` 会打开微信小游戏侧边栏，领取可用礼包，给两条未点赞动态点赞并发送评论；关闭侧边栏后继续领取游戏圈、添加桌面的社区奖励和首页消息奖励。`message` 模式会尝试通过 Windows 消息后台输入评论，不激活窗口；如果当前微信版本不响应后台键盘消息，可切换为 `foreground`。
-
-`daily_rewards` 会领取活跃度和奖励页中的可用奖励，默认作为总流程的最后一个模块执行；消息奖励已在 `game_circle` 末尾领取，不会重复执行。
-
-`endless_mode` 会进入无尽模式世界竞赛，默认执行两轮闪击：参赛、选择助战、购买烈火、闪击进入战斗；战斗中检测到宝箱数量达到 5 后，会将飞机拖到屏幕上半部分等待坠机，然后领取奖励并返回竞赛页。
-
-`event_stage` 会进入闯关模式的活动关卡，执行第一个活动“陨石陷阱”的闪击；战斗中若坠机会点击广告复活并在广告结束后继续等待；战斗结束后轮询结算页并点击“继续”，回到活动关卡页后点击左上角首页返回。
-
-`boss_mode` 会进入闯关模式的 BOSS 模式，并按当天日期选择两个板块：偶数日期挑战第1、2板块，奇数日期挑战第3、4板块；每个板块进入后会以敌方战力 `15682` 判断“极难”，未命中时通过固定位置切换难度，再执行闪击。战斗中若坠机会点击广告复活并继续等待，结算后点击“继续”并返回板块选择页。
-
-`level_sweep` 会进入闯关模式，先处理逐星长阶的逐星信标和逐星补给，再按 `config.py` 中的 `LEVEL_SWEEP_PLAN` 配置执行普通/英雄难度快速扫荡。每个关卡条目使用 `level` 指定关卡号，并可分别设置 `sweeps` 扫荡次数和 `double_rewards` 广告双倍次数；若扫荡后触发突发事件，会进入后返回闯关模式，并重新打开快速扫荡继续剩余关卡；首次累计实际扫荡 5 个关卡后，会退出快速扫荡领取顶部奖励，再恢复扫荡。
-
----
-
-## 4. 截图方式与点击方式
-
-### 截图方式
-
-```bash
---capture-method printwindow
+```powershell
+python main.py --sections backpack --enable-resource-sale
 ```
 
-默认方式。尝试使用 Win32 `PrintWindow` 捕获窗口客户区。理论上可以在窗口被遮挡时截图，但微信小游戏属于 Chromium/WebGL/Canvas 渲染，不保证所有机器都能正确捕获。
+查看全部参数：
 
-```bash
---capture-method mss
-```
-
-截取窗口客户区在屏幕上的实际区域。稳定直观，但要求窗口可见且不能被遮挡。
-
-### 点击方式
-
-```bash
---click-method message
-```
-
-默认方式。通过 Win32 `PostMessage` 向微信窗口/子窗口发送鼠标消息，通常不会移动物理鼠标，也不一定抢你的主机鼠标。但微信小游戏不保证一定响应这种后台点击。
-
-```bash
---click-method foreground
-```
-
-激活微信窗口后用 `pyautogui` 执行真实鼠标点击。响应最稳定，但会占用鼠标和前台焦点，运行时不适合同时正常操作电脑。
-
-建议先测试：
-
-```bash
-python tools/click_test.py --window-title 雷霆 --x 360 --y 640 --click-method message
-python tools/swipe_test.py --window-title 雷霆 --x1 360 --y1 1030 --x2 360 --y2 520 --duration 0.5 --press-delay 0.12 --release-delay 0.28 --click-method message
-```
-
-如果游戏不响应后台点击，再改用：
-
-```bash
-python main.py --click-method foreground
-```
-
----
-
-## 5. 固定窗口客户区尺寸
-
-本工程默认尝试把电脑端微信小程序窗口的 **client rect** 调整为：
-
-```text
-720 × 1280
-```
-
-原因是模板图片、ROI 区域和固定点击坐标都基于这个坐标系。窗口大小变化后，按钮在截图中的尺寸和位置都会变化，OpenCV 匹配分数会下降，点击坐标也会偏移。
-
-正式运行建议：
-
-```bash
-python main.py
-```
-
-如果窗口被完全遮挡后 `message` 点击不响应，可以用 resize nudge 刷新窗口状态。该工具会先显示并置前窗口，再轻微改变客户区尺寸并恢复到目标尺寸：
-
-```bash
-python tools/refresh_window.py --window-title 雷霆战机：集结
-```
-
-截图制作模板时，也建议使用同样尺寸：
-
-```bash
-python tools/capture_window.py --window-title 雷霆战机：集结 --out screenshots/pc_home.png
-```
-
-如果微信窗口受显示器高度或自身限制，无法调整到 720×1280，程序会停止运行。此时应固定一个实际可达尺寸，然后重新截图、裁剪模板并同步修改 `config.py` 里的 ROI 和固定点击坐标。
-
----
-
-## 6. 重要：电脑端微信需要重新制作模板
-
-当前 `templates/` 中保留的是模拟器 720×1280 版本裁剪出的模板。电脑端微信的窗口比例、字体渲染、按钮大小可能不同，因此可能不能直接识别。
-
-推荐流程：
-
-1. 固定电脑端微信小程序窗口客户区尺寸，主程序和截图工具默认会调整到 720×1280。
-2. 使用工具截图：
-
-```bash
-python tools/capture_window.py --window-title 雷霆战机：集结 --out screenshots/pc_home.png
-```
-
-3. 用截图软件或图片工具裁剪按钮模板，覆盖 `templates/` 中对应文件。
-4. 修改 `config.py` 中对应模板的 `roi`。
-5. 用调试工具检查匹配分数：
-
-```bash
-python tools/template_debug.py screenshots/pc_home.png
-```
-
-模板坐标和点击坐标都基于 **微信窗口客户区截图**，也就是截图左上角为 `(0, 0)`。
-
----
-
-## 7. 参数说明
-
-```bash
+```powershell
 python main.py --help
 ```
 
-主要参数：
+默认不保存历史截图和日志文件，只在 GUI 或终端显示日志，并覆盖 `.runtime/current_screenshot.png` 供识别使用。需要保留运行记录时，可在 GUI 中开启对应选项，或使用：
+
+```powershell
+python main.py --save-screenshots --save-logs
+```
+
+## 常见问题
+
+### 找不到游戏窗口
+
+确认小程序已经作为独立窗口打开，且标题为 `雷霆战机：集结`。可以使用：
+
+```powershell
+python tools\window_probe.py --keyword 雷霆
+```
+
+### 游戏窗口尺寸调整失败
+
+模板和点击坐标依赖 `720 × 1280` 客户区。如果显示器可用高度不足、微信限制窗口大小或系统环境特殊，程序可能无法达到目标尺寸并停止运行。
+
+不建议简单关闭尺寸检查后继续使用，因为识别位置和点击坐标可能随之偏移。更换尺寸通常需要同时重做模板、ROI 和固定坐标。
+
+### 游戏更新后无法识别
+
+先使用 GUI 的截图和模板匹配调试确认失败模板。必要时重新截取对应按钮，替换 `templates/` 中的图片，并同步调整 `config.py` 中的识别区域和阈值。
+
+### 运行中断
+
+查看 GUI 输出日志，确认停止在哪个模块。界面动画、广告、网络加载、活动变化和临时弹窗都可能导致流程与预期不同。建议先单独运行失败模块，确认稳定后再执行完整流程。
+
+## 项目结构
 
 ```text
---capture-method          printwindow 或 mss
---click-method            message 或 foreground
---no-force-client-size    不自动调整两个窗口的客户区尺寸；仍会严格检查当前尺寸
---client-width            游戏窗口目标客户区宽度，默认720
---client-height           游戏窗口目标客户区高度，默认1280
---toolbox-client-width    Yang昜工具箱目标客户区宽度，默认414
---toolbox-client-height   Yang昜工具箱目标客户区高度，默认780
---save-screenshots        保存运行过程中的历史截图；不加时只覆盖 .runtime/current_screenshot.png
---save-logs               保存 logs/daily_run_*.log 日志文件；不加时只输出到终端或 GUI 日志窗口
---enable-resource-sale    在 backpack 模块中额外执行资源残骸出售；默认关闭
---sections                选择执行模块；固定顺序：redemption_code,game_circle,decade_reunion,shop,interstellar,stamina,team,backpack,treasure_hunt,event_stage,level_sweep,boss_mode,endless_mode,daily_rewards
---list-windows            精确列出 config.py 中配置的游戏窗口后退出
+main.py                 命令行入口
+gui_launcher.py         图形界面入口
+runner.py               日活流程与模块调度
+windows_controller.py   微信窗口截图和输入控制
+vision.py               OpenCV 模板识别
+config.py               用户配置、模板和坐标参数
+templates/              图像识别模板
+tools/                  窗口、截图、点击、滑动和模板调试工具
 ```
 
----
+## 使用说明
 
-## 8. 目录说明
-
-```text
-thunder_daily_auto_windows_host/
-├── main.py                  # 程序入口
-├── gui_launcher.py          # 图形界面启动器
-├── start_gui.bat            # 双击启动 GUI
-├── install_deps.bat         # 双击安装依赖
-├── run_all_default.bat      # 默认参数运行全部模块
-├── runner.py                # 日活流程逻辑与模块调度
-├── windows_controller.py    # Windows微信窗口截图与点击控制层
-├── vision.py                # OpenCV模板匹配
-├── config.py                # 模板、ROI、阈值、窗口默认参数
-├── requirements.txt         # Python依赖
-├── templates/               # 按钮模板；电脑端微信建议重新裁剪覆盖
-├── screenshots/             # 运行时截图、调试截图
-├── logs/                    # 运行日志
-└── tools/
-    ├── window_probe.py      # 枚举窗口标题、客户区尺寸
-    ├── capture_window.py    # 截取微信窗口客户区
-    ├── click_test.py        # 测试后台/前台点击是否有效
-    ├── swipe_test.py        # 测试后台/前台滑动是否有效
-    ├── refresh_window.py    # 轻微改变客户区尺寸再恢复，用于刷新窗口状态
-    └── template_debug.py    # 对一张截图测试所有模板匹配分数
-```
-
----
-
-## 9. 运行建议
-
-主机电脑微信窗口方案无法像虚拟机那样彻底隔离。实际稳定性取决于两个因素：
-
-```text
-PrintWindow 是否能正确截取微信小游戏画面；
-PostMessage 后台点击是否能被微信小游戏响应。
-```
-
-如果二者都可用，你可以在脚本运行时继续轻度使用电脑；如果不稳定，就需要切换到：
-
-```bash
---capture-method mss --click-method foreground
-```
-
-这种方式最稳，但会影响你正常使用鼠标和前台窗口。
+- 建议先单独运行少量低风险模块，再逐步启用完整流程。
+- 游戏活动、奖励入口和广告页面可能随版本更新而变化。
+- 使用前请自行确认账号状态、资源消耗和出售配置。
+- 请遵守微信、游戏及所在地区的相关规则；使用本项目产生的风险由使用者自行承担。

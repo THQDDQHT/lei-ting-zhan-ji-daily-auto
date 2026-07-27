@@ -21,7 +21,7 @@ from config import (
     TARGET_CLIENT_HEIGHT,
     TOOLBOX_CLIENT_HEIGHT,
     TOOLBOX_CLIENT_WIDTH,
-    DEFAULT_NO_FORCE_CLIENT_SIZE,
+    DEFAULT_FORCE_CLIENT_SIZE,
     LEVEL_SWEEP_PLAN,
     RESOURCE_SALE_WRECKS,
     POSITION_SPECS,
@@ -122,7 +122,7 @@ class DailyFlowRunner:
         )
         return res
 
-    def wait_until_not_loading( # 后续新增其他的加载动画，也可以等待（做法：新增传参）。或者新增函数def wait_until()，函数功能会类似旧click_template，多次尝试识别一个模版
+    def wait_until_not_loading(
         self,
         retries: int = 5,
         interval: float = 8.8,
@@ -449,6 +449,8 @@ class DailyFlowRunner:
         logging.info("========== 微信游戏圈&社区奖励流程开始 ==========")
         logging.info("打开微信小游戏侧边栏")
         self.click_template("sidebar_open", tap_delay=3.6)
+        force_client_size = self.ctrl.force_client_size
+        self.ctrl.force_client_size = False
 
         logging.info("进入游戏圈")
         self.click_template("sidebar_circle_tab", tap_delay=3.6)
@@ -476,6 +478,7 @@ class DailyFlowRunner:
 
         self.click_template("sidebar_comment_close")
         self.click_template("sidebar_close", tap_delay=3.6) # 窗口尺寸还原，等待一段时间后检测尺寸
+        self.ctrl.force_client_size = force_client_size
         logging.info("微信小游戏侧边栏已关闭")
         self.ctrl.assert_client_size()
 
@@ -501,7 +504,6 @@ class DailyFlowRunner:
         logging.info("========== 十年集结领取开始 ==========")
         if self.click_template("home_decade_reunion", required=False).found:
             self.click_template("home_sub_decade_reunion", required=False)
-            # time.sleep(3.6) # 进入十年集结动画时间
             logging.info("十年集结弹幕发送开始")
             if self.click_template("send_comment", required=False, settle_seconds=3.6).found:
                 self.click_template("send")
@@ -544,17 +546,17 @@ class DailyFlowRunner:
     # ==================== 星际探索领取 ====================
 
     def enter_interstellar(self) -> None:
-        logging.info("步骤1：从首页进入星际探索")
+        logging.info("进入星际探索")
         self.click_template("home_interstellar")
 
     def claim_interstellar_income(self) -> None:
-        logging.info("步骤2：星际探索页面领取累计收益，若在冷却中则跳过领取")
+        logging.info("星际探索页面领取累计收益，若在冷却中则跳过领取")
         if self.click_template("star_claim", required=False).found:
             self.click_template("reward_claim")
 
     def run_quick_exploration(self) -> None:
         """开始4次快速探索。"""
-        logging.info("步骤3：执行快速探索")
+        logging.info("执行快速探索")
 
         if self.click_template("star_quick", required=False).found:
             
@@ -581,17 +583,11 @@ class DailyFlowRunner:
             self.tap_position("exit_mid_down")
             self.deal_endless_mode_event_when_back_to_home()
 
-    # def exit_interstellar_to_home(self) -> None:
-    #     logging.info("步骤4：点击底部退出星际探索回到首页")
-    #     self.tap_position("exit_mid_down")
-    #     self.tap_position("exit_mid_down") # 再次点击底部，应对无法进入广告的情况，确保回到首页。
-
     def run_interstellar_flow(self) -> None:
         logging.info("========== 星际探索领取开始 ==========")
         self.enter_interstellar()
         self.claim_interstellar_income()
         self.run_quick_exploration()
-        # self.exit_interstellar_to_home()
         logging.info("========== 星际探索领取结束 ==========")
 
     # ==================== 体力获取 ====================
@@ -630,6 +626,17 @@ class DailyFlowRunner:
         logging.info("从首页进入战队")
         self.click_template("home_team")
 
+    def wait_and_confirm_team_expedition(self, check_interval: float = 10.0) -> None:
+        time.sleep(120) # 固定等待120秒
+        round_idx = 1
+        while True:
+            if self.click_template("team_expedition_confirm", required=False, settle_seconds=-1.0).found:
+                logging.info("战队征讨：检测到挑战完成按钮并已点击")
+                return
+            logging.info("战队征讨：尚未结束，等待%.1f秒后继续检测，当前第%d次检测", check_interval, round_idx)
+            time.sleep(check_interval)
+            round_idx += 1
+
     def team_expedition(self) -> None:
         logging.info("战队征讨开始")
         if self.click_template("team_expedition_going_on", required=False).found:
@@ -646,8 +653,7 @@ class DailyFlowRunner:
                     self.tap_position("exit_mid_down")
                     break
                 logging.info("等待征讨中......")
-                time.sleep(140.0)
-                self.click_template("team_expedition_confirm")
+                self.wait_and_confirm_team_expedition()
                 round_idx += 1
             if self.click_template("team_expedition_claim", required=False).found:
                 logging.info("已领取今日伤害奖励")
@@ -658,8 +664,6 @@ class DailyFlowRunner:
             logging.info("战队征讨——公示中，不进行征讨")
         logging.info("战队征讨结束")
     
-    # TEAM_DONATION_ROUNDS = 3 #之后要改掉，不要固定循环次数，这样可以避免中途处bug退出，但是又无法重新执行，识别3/3
-
     def team_donation(self) -> None:
         logging.info("战队捐献开始")
         self.click_template("team_donate_entry")
@@ -684,17 +688,6 @@ class DailyFlowRunner:
                 break
             self.click_template("reward_claim")
             round_idx2 += 1
-
-        # for idx in range(1, self.TEAM_DONATION_ROUNDS + 1):
-        #     logging.info("战队金币捐献：第%d/%d次", idx, self.TEAM_DONATION_ROUNDS)
-        #     self.click_template("team_coin_donate")
-        #     self.click_template("reward_claim")
-
-        # for idx in range(1, self.TEAM_DONATION_ROUNDS + 1):
-        #     logging.info("战队钻石捐献：第%d/%d次", idx, self.TEAM_DONATION_ROUNDS)
-        #     self.click_template("team_diamond_donate")
-        #     self.click_template("team_diamond_donate_confirm")
-        #     self.click_template("reward_claim")
 
         self.tap_position("exit_mid_down")
         logging.info("战队捐献结束")
@@ -757,20 +750,6 @@ class DailyFlowRunner:
             logging.info("已选择拆分装备，继续拆分流程")
             self.click_template("split")
             self.click_template("confirm") # 装备拆分确认弹窗
-            
-            # self.recognize_template("select_split_equipment", required=False) # 可能识别到：1.loading 2.拆分动画 3.select_split_equipment，因此做一个保障，防止self.click_template("enter_synthesis")的时候刚好在动画播放过程
-            # time.sleep(2.4) # 拆分动画占空时间，现在可以用settle_seconds解决
-            # idx = 1
-            # while True:
-            #     time.sleep(1.0)
-            #     if self.recognize_template("select_split_equipment", required=False).found:
-            #         # 检测到select_split_equipment重新出现，说明拆分动画完成。
-            #         break
-            #     idx += 1
-            #     if idx > 10:  # 防止无限循环
-            #         logging.error("装备拆分循环异常，强制跳出循环")
-            #         break
-
             logging.info("蓝色+1装备拆分完成，再次回到装备合成界面，尝试蓝色装备合成")
             self.click_template("enter_synthesis", settle_seconds=2.4) # 拆分动画占空时间settle_seconds
             self.synthesis_one_type_of_equipment("blue")
@@ -966,8 +945,7 @@ class DailyFlowRunner:
 
         logging.info("进入夺宝-兑换界面")
         self.click_template("treasure_hunt_redeem")
-        time.sleep(1.2) # 星辉出现动画时间
-        if self.click_template("claim_star", required=False).found:
+        if self.click_template("claim_star", required=False, settle_seconds=1.2).found: # 星辉出现动画占用settle_seconds时间
             self.click_template("reward_claim")
         self.back_to_home()
         logging.info("========== 夺宝领取结束 ==========")
@@ -1125,7 +1103,6 @@ class DailyFlowRunner:
 
                 self.quick_sweep_level_once(difficulty, level, sweep_index, use_double_reward)
 
-                #
                 if self.recognize_template("join_now", required=False, settle_seconds=1.5).found:
                     logging.info("无尽限时小组赛/无尽争霸赛事件已出现，立即参加后返回闯关模式继续关卡扫荡")
                     self.click_template("endless_mode_known", required=False, settle_seconds=4.8) # 可能会出现本周超频装备信息界面，出现在 立即参加 界面之上，需要先点击 知道了 按钮
@@ -1136,17 +1113,8 @@ class DailyFlowRunner:
                     elif self.recognize_template("endless_championship", required=False).found:
                         logging.info("立即参加无尽争霸赛")
                         self.click_template("join_now")
-                        self.click_template("back", settle_seconds=4.8) # 无尽争霸赛返回按钮，返回之后会退回到首页，吗？？TODO 实测好像不是这样
-                        # self.click_template("home_challenge_mode")
+                        self.click_template("back", settle_seconds=4.8) # 无尽争霸赛返回按钮
                     self.reopen_quick_sweep(difficulty)
-                #
-
-                # if self.click_template("join_now", required=False, tap_delay=5.4).found: # 此处在每周开始还会出现超频装备
-                #     logging.info("无尽限时小组赛/无尽争霸赛事件已出现，立即参加后返回闯关模式继续关卡扫荡")
-                #     self.click_template("limited_time_group_match_close", tap_delay=3.6, required=False) # 无尽限时小组赛关闭按钮
-                #     if self.click_template("back", tap_delay=3.6, required=False).found: # 无尽争霸赛返回按钮，返回之后会退回到首页
-                #         self.click_template("home_challenge_mode")
-                #     self.reopen_quick_sweep(difficulty)
 
                 if self.level_sweep_swept_count >= 5 and not self.level_sweep_periodic_reward_claimed:
                     self.tap_position("exit_mid_down") # 固定点击动作，退出快速扫荡界面
@@ -1465,9 +1433,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-force-client-size",
-        action="store_true",
-        default=DEFAULT_NO_FORCE_CLIENT_SIZE,
-        help="不自动调整游戏和Yang昜工具箱客户区尺寸，但仍严格校验",
+        dest="force_client_size",
+        action="store_false",
+        default=DEFAULT_FORCE_CLIENT_SIZE,
+        help="关闭客户区尺寸自动调整；初始尺寸不匹配时只记录警告",
     )
     parser.add_argument(
         "--client-width",
@@ -1544,7 +1513,7 @@ def main() -> None:
             click_method=args.click_method,
             client_width=args.client_width,
             client_height=args.client_height,
-            no_force_client_size=args.no_force_client_size,
+            force_client_size=args.force_client_size,
         )
         toolbox_controller: Optional[WindowsController] = None
         if "redemption_code" in args.sections:
@@ -1554,7 +1523,7 @@ def main() -> None:
                 click_method=args.click_method,
                 client_width=args.toolbox_client_width,
                 client_height=args.toolbox_client_height,
-                no_force_client_size=args.no_force_client_size,
+                force_client_size=args.force_client_size,
             )
         runner = DailyFlowRunner(
             game_controller=game_controller,

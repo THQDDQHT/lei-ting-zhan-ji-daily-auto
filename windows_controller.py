@@ -48,7 +48,7 @@ class WindowsController:
 
     client_width/client_height:
         同时传入时作为该窗口实例的目标客户区尺寸。构造时默认自动调整并严格校验；
-        no_force_client_size=True 时跳过调整，但仍会严格校验当前尺寸。
+        force_client_size=False 时跳过自动调整，尺寸不匹配只记录警告。
     """
 
     def __init__(
@@ -58,7 +58,7 @@ class WindowsController:
         click_method: str = "message",
         client_width: int = 720,
         client_height: int = 1280,
-        no_force_client_size: bool = False,
+        force_client_size: bool = True,
     ):
         if client_width <= 0 or client_height <= 0:
             raise ValueError("客户区宽高必须大于 0")
@@ -68,7 +68,7 @@ class WindowsController:
         self.click_method = click_method.lower().strip()
         self.client_width = client_width
         self.client_height = client_height
-        self.no_force_client_size = no_force_client_size
+        self.force_client_size = force_client_size
         self.hwnd: Optional[int] = None
 
         if self.capture_method not in {"printwindow", "mss"}:
@@ -90,7 +90,10 @@ class WindowsController:
             ) from exc
 
         self.refresh_window()
-        if not self.no_force_client_size and not self.resize_client_to():
+        if self.force_client_size and not self.resize_client_to(
+            self.client_width,
+            self.client_height,
+        ):
             raise WindowsControllerError(
                 f"无法将 {self.window_title!r} 客户区调整为 {self.client_width}x{self.client_height}"
             )
@@ -182,8 +185,8 @@ class WindowsController:
 
     def resize_client_to(
         self,
-        target_width: Optional[int] = None,
-        target_height: Optional[int] = None,
+        target_width: int,
+        target_height: int,
     ) -> bool:
         """尝试一次性把窗口客户区调整到 target_width × target_height。
 
@@ -193,8 +196,6 @@ class WindowsController:
         import win32con
         import win32gui
 
-        target_width = self.client_width if target_width is None else target_width
-        target_height = self.client_height if target_height is None else target_height
         if target_width <= 0 or target_height <= 0:
             raise ValueError("客户区宽高必须大于 0")
         hwnd = self._ensure_hwnd()
@@ -289,22 +290,47 @@ class WindowsController:
         restore_ok = self.resize_client_to(restore_width, restore_height)
         return nudge_ok and restore_ok
 
-    def assert_client_size(self) -> None:
-        """严格检查客户区尺寸，不满足则抛出异常，避免模板和坐标在错误尺寸下运行。"""
+    def assert_client_size(self) -> bool:
+        """检查客户区尺寸；未强制调整时，尺寸不匹配只记录警告。"""
         width, height = self.get_client_size()
         logging.info("当前窗口客户区尺寸：%dx%d；期望：%dx%d", width, height, self.client_width, self.client_height)
-        if width != self.client_width or height != self.client_height:
-            raise WindowsControllerError(
-                f"窗口客户区尺寸不符合要求：当前 {width}x{height}，"
-                f"期望 {self.client_width}x{self.client_height}。"
-                "默认会自动调整；若已使用 --no-force-client-size，请手动调整微信小程序窗口大小。"
-            )
+        if width == self.client_width and height == self.client_height:
+            return True
+
+        message = (
+            f"窗口客户区尺寸不符合要求：当前 {width}x{height}，"
+            f"期望 {self.client_width}x{self.client_height}"
+        )
+        if self.force_client_size:
+            raise WindowsControllerError(message)
+
+        logging.warning("%s；未启用强制调整，继续运行", message)
+        return False
+
+    def _ensure_client_size_before_interaction(self) -> None:
+        if not self.force_client_size:
+            return
+
+        width, height = self.get_client_size()
+        if width == self.client_width and height == self.client_height:
+            return
+
+        logging.warning(
+            "窗口交互前发现客户区尺寸变化：当前 %dx%d，目标 %dx%d，开始调整",
+            width,
+            height,
+            self.client_width,
+            self.client_height,
+        )
+        if not self.resize_client_to(self.client_width, self.client_height):
+            self.assert_client_size()
 
     def activate(self) -> None:
         import pyautogui
         import win32con
         import win32gui
 
+        self._ensure_client_size_before_interaction()
         hwnd = self._ensure_hwnd()
         try:
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
@@ -321,6 +347,7 @@ class WindowsController:
     # ---------- 截图 ----------
 
     def screenshot(self, save_path: str | Path) -> Path:
+        self._ensure_client_size_before_interaction()
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -407,6 +434,7 @@ class WindowsController:
     # ---------- 点击与滑动 ----------
 
     def tap(self, x: float, y: float, delay: float = 0.8) -> None:
+        self._ensure_client_size_before_interaction()
         if self.click_method == "message":
             ok = self._tap_by_message(x, y)
             if not ok:
@@ -466,6 +494,7 @@ class WindowsController:
         press_delay 表示按下鼠标后到开始移动前的等待时间；
         release_delay 表示移动到终点后到抬起鼠标前的等待时间。
         """
+        self._ensure_client_size_before_interaction()
         if self.click_method == "message":
             ok = self._swipe_by_message(
                 x1,
@@ -584,6 +613,7 @@ class WindowsController:
         if not text:
             raise ValueError("输入文本不能为空")
 
+        self._ensure_client_size_before_interaction()
         if self.click_method == "message":
             self._type_text_by_message(text, interval=interval)
         else:
@@ -613,6 +643,7 @@ class WindowsController:
 
     def clear_text(self, delay: float = 0.5) -> None:
         """按当前点击模式清空已经获得焦点的输入框。"""
+        self._ensure_client_size_before_interaction()
         if self.click_method == "message":
             self._clear_text_by_message()
         else:
@@ -624,27 +655,23 @@ class WindowsController:
         import pyautogui
 
         self.activate()
-        pyautogui.hotkey("ctrl", "a")
-        pyautogui.press("backspace")
+        pyautogui.press("backspace", presses=8, interval=0.05)
 
     def _clear_text_by_message(self) -> None:
         import win32api
         import win32con
 
         target = self._ensure_hwnd()
-        win32api.PostMessage(target, win32con.WM_KEYDOWN, win32con.VK_CONTROL, 0)
-        win32api.PostMessage(target, win32con.WM_KEYDOWN, ord("A"), 0)
-        win32api.PostMessage(target, win32con.WM_CHAR, 1, 1)
-        win32api.PostMessage(target, win32con.WM_KEYUP, ord("A"), 0)
-        win32api.PostMessage(target, win32con.WM_KEYUP, win32con.VK_CONTROL, 0)
-        time.sleep(0.05)
-        win32api.PostMessage(target, win32con.WM_KEYDOWN, win32con.VK_BACK, 0)
-        win32api.PostMessage(target, win32con.WM_CHAR, 8, 1)
-        win32api.PostMessage(target, win32con.WM_KEYUP, win32con.VK_BACK, 0)
+        for _ in range(8):
+            win32api.PostMessage(target, win32con.WM_KEYDOWN, win32con.VK_BACK, 0)
+            win32api.PostMessage(target, win32con.WM_CHAR, 8, 1)
+            win32api.PostMessage(target, win32con.WM_KEYUP, win32con.VK_BACK, 0)
+            time.sleep(0.05)
 
     def press_key(self, key: str, delay: float = 0.8) -> None:
         """按当前点击模式发送单个按键。"""
         key = key.lower().strip()
+        self._ensure_client_size_before_interaction()
         if self.click_method == "message":
             self._press_key_by_message(key)
         else:
@@ -706,6 +733,7 @@ class WindowsController:
 
     def copy_selected_text(self, delay: float = 0.5) -> str:
         """复制窗口中已经选中的文本并返回剪贴板内容。"""
+        self._ensure_client_size_before_interaction()
         self.clear_clipboard()
         if self.click_method == "message":
             self._copy_selected_text_by_message()

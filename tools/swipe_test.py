@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 from config import (
     DEFAULT_CAPTURE_METHOD,
     DEFAULT_CLICK_METHOD,
-    DEFAULT_NO_FORCE_CLIENT_SIZE,
+    DEFAULT_FORCE_CLIENT_SIZE,
     DEFAULT_WINDOW_TITLE,
     TARGET_CLIENT_HEIGHT,
     TARGET_CLIENT_WIDTH,
@@ -29,7 +29,7 @@ def main() -> None:
     parser.add_argument("--window-title", default=DEFAULT_WINDOW_TITLE)
     parser.add_argument("--capture-method", choices=["printwindow", "mss"], default=DEFAULT_CAPTURE_METHOD)
     parser.add_argument("--click-method", choices=["message", "foreground"], default=DEFAULT_CLICK_METHOD)
-    parser.add_argument("--no-force-client-size", action="store_true", default=DEFAULT_NO_FORCE_CLIENT_SIZE, help="滑动前不调整客户区尺寸")
+    parser.add_argument("--no-force-client-size", dest="force_client_size", action="store_false", default=DEFAULT_FORCE_CLIENT_SIZE, help="滑动前不自动调整客户区尺寸")
     parser.add_argument("--client-width", type=int, default=TARGET_CLIENT_WIDTH, help="目标客户区宽度，默认720")
     parser.add_argument("--client-height", type=int, default=TARGET_CLIENT_HEIGHT, help="目标客户区高度，默认1280")
     parser.add_argument("--x1", type=float, required=True)
@@ -47,7 +47,7 @@ def main() -> None:
         click_method=args.click_method,
         client_width=args.client_width,
         client_height=args.client_height,
-        no_force_client_size=args.no_force_client_size,
+        force_client_size=args.force_client_size,
     )
     ctrl.swipe(
         args.x1,
