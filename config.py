@@ -30,6 +30,28 @@ DEFAULT_FORCE_CLIENT_SIZE = True
 
 # 关卡扫荡配置。
 # sweeps 表示该关卡扫荡几次；double_rewards 表示该关前几次扫荡领取广告双倍奖励。
+# 深空巡航配置。真正深空巡航需要先完成当期普通星域巡航；本流程将其视为外部前置，未解锁时安全跳过。
+DEEP_SPACE_CRUISE_CONFIG = {
+    "max_runs": 1,
+    "initial_wait_seconds": 30.0,
+    "poll_interval_seconds": 5.0,
+    "battle_timeout_seconds": 480.0,
+    "revive_by_ad": True,
+}
+
+# 超限模式配置。普通挑战优先解锁关卡；超限挑战不启用消耗资源的 MAX 装备试用。
+# target_runs_per_board 表示该空间站要达到的聚合完成槽位数：普通/超限各占一个槽位。
+OVERLIMIT_MODE_CONFIG = {
+    "boards": ("draco", "cygnus", "pegasus", "andromeda"),
+    "run_normal_challenge": True,
+    "run_overlimit_challenge": True,
+    "target_runs_per_board": 2,
+    "initial_wait_seconds": 12.0,
+    "poll_interval_seconds": 5.0,
+    "battle_timeout_seconds": 240.0,
+    "revive_by_ad": True,
+}
+
 LEVEL_SWEEP_PLAN = {
     "normal": [
         {"level": 128, "sweeps": 2, "double_rewards": 2},
@@ -1299,6 +1321,259 @@ TEMPLATE_SPECS = {
         "roi": (0, 980, 180, 1180),
         "grayscale": False,
         "desc": "战斗页左下角：高能爆弹按钮",
+    },
+
+    # ===== 普通星域巡航与深空巡航 =====
+    "challenge_deep_space_cruise": {
+        "file": "challenge_deep_space_cruise.png",
+        "threshold": 0.86,
+        "roi": (500, 300, 660, 450),
+        "grayscale": False,
+        "desc": "闯关模式右上：巡航入口",
+    },
+    "expedition_page": {
+        "file": "expedition_page.png",
+        "threshold": 0.90,
+        "roi": (150, 40, 450, 130),
+        "desc": "普通星域巡航：本期巡航剩余时间静态标题（不含动态倒计时）",
+    },
+    "expedition_agent": {
+        "file": "expedition_agent.png",
+        "threshold": 0.86,
+        "roi": (0, 970, 200, 1080),
+        "desc": "普通星域巡航左下：作战代理",
+    },
+    "expedition_available_enemy": {
+        "file": "expedition_available_enemy.png",
+        "threshold": 0.90,
+        "roi": (20, 620, 170, 770),
+        "grayscale": False,
+        "desc": "普通星域巡航地图左下：动态节点视觉模板",
+    },
+    "expedition_available_enemy_right": {
+        "file": "expedition_available_enemy_right.png",
+        "threshold": 0.90,
+        "roi": (530, 810, 690, 950),
+        "grayscale": False,
+        "desc": "普通星域巡航地图右下：动态节点视觉模板",
+    },
+    "expedition_enemy": {
+        "file": "expedition_enemy.png",
+        "threshold": 0.86,
+        "roi": (20, 160, 330, 340),
+        "desc": "普通星域巡航敌人详情：一组敌机与推荐战力（仅用于调试）",
+    },
+    "expedition_challenge": {
+        "file": "expedition_challenge.png",
+        "threshold": 0.86,
+        "roi": (260, 1060, 460, 1180),
+        "grayscale": False,
+        "desc": "普通星域巡航敌人详情：挑战按钮",
+    },
+    "expedition_force_challenge_confirm": {
+        "file": "expedition_force_challenge_confirm.png",
+        "threshold": 0.90,
+        "roi": (420, 630, 580, 760),
+        "grayscale": False,
+        "desc": "普通星域巡航低战力提示：确认强制挑战（不消耗资源）",
+    },
+    "cruise_revive_close": {
+        "file": "cruise_revive_close.png",
+        "threshold": 0.90,
+        "roi": (550, 540, 660, 640),
+        "grayscale": False,
+        "desc": "巡航战斗坠机弹窗：关闭按钮",
+    },
+    "cruise_ad_revive": {
+        "file": "cruise_ad_revive.png",
+        "threshold": 0.90,
+        "roi": (400, 620, 580, 740),
+        "grayscale": False,
+        "desc": "巡航战斗坠机弹窗：广告复活按钮",
+    },
+    "cruise_result_continue": {
+        "file": "cruise_result_continue.png",
+        "threshold": 0.90,
+        "roi": (270, 1050, 450, 1190),
+        "grayscale": False,
+        "desc": "巡航通用结算：继续按钮",
+    },
+    "cruise_result_victory": {
+        "file": "cruise_result_victory.png",
+        "threshold": 0.94,
+        "roi": (500, 920, 700, 1040),
+        "grayscale": False,
+        "desc": "普通星域巡航胜利结算：右侧空白区",
+    },
+    "cruise_result_defeat": {
+        "file": "cruise_result_defeat.png",
+        "threshold": 0.94,
+        "roi": (500, 920, 700, 1040),
+        "grayscale": False,
+        "desc": "普通星域巡航失败结算：强化提示",
+    },
+    "expedition_equation_page": {
+        "file": "expedition_equation_page.png",
+        "threshold": 0.86,
+        "roi": (170, 250, 550, 370),
+        "desc": "普通星域巡航胜利后：选择增益方程",
+    },
+    "expedition_equation_middle": {
+        "file": "expedition_equation_middle.png",
+        "threshold": 0.86,
+        "roi": (220, 420, 510, 880),
+        "grayscale": False,
+        "desc": "普通星域巡航：一组中间增益方程卡片（仅用于调试）",
+    },
+    "deep_space_cruise_entry": {
+        "file": "deep_space_cruise_entry.png",
+        "threshold": 0.82,
+        "roi": (80, 500, 640, 860),
+        "grayscale": False,
+        "desc": "普通星域巡航完成后：真正深空巡航入口",
+    },
+    "deep_space_cruise_page": {
+        "file": "deep_space_cruise_page.png",
+        "threshold": 0.82,
+        "roi": (120, 200, 600, 520),
+        "grayscale": False,
+        "desc": "真正深空巡航页面静态标志",
+    },
+    "deep_space_cruise_sortie": {
+        "file": "deep_space_cruise_sortie.png",
+        "threshold": 0.86,
+        "roi": (190, 1140, 540, 1270),
+        "grayscale": False,
+        "desc": "真正深空巡航底部出击按钮",
+    },
+    "deep_space_cruise_info_close": {
+        "file": "deep_space_cruise_info_close.png",
+        "threshold": 0.86,
+        "roi": (580, 190, 715, 300),
+        "grayscale": False,
+        "desc": "真正深空巡航首次规则弹窗关闭按钮",
+    },
+
+    # ===== 超限模式 =====
+    "boss_mode_overlimit_entry": {
+        "file": "boss_mode_overlimit_entry.png",
+        "threshold": 0.86,
+        "roi": (200, 1120, 520, 1260),
+        "grayscale": False,
+        "desc": "BOSS模式底部：超限模式入口",
+    },
+    "overlimit_mode_page": {
+        "file": "overlimit_mode_page.png",
+        "threshold": 0.86,
+        "roi": (180, 210, 540, 340),
+        "grayscale": False,
+        "desc": "超限模式：页面标题与活动时间",
+    },
+    "overlimit_mode_board_draco": {
+        "file": "overlimit_mode_board_draco.png",
+        "threshold": 0.86,
+        "roi": (80, 430, 370, 620),
+        "desc": "超限模式：天龙座空间站",
+    },
+    "overlimit_mode_board_cygnus": {
+        "file": "overlimit_mode_board_cygnus.png",
+        "threshold": 0.86,
+        "roi": (410, 590, 700, 770),
+        "desc": "超限模式：白鸟座空间站",
+    },
+    "overlimit_mode_board_pegasus": {
+        "file": "overlimit_mode_board_pegasus.png",
+        "threshold": 0.86,
+        "roi": (70, 840, 370, 1030),
+        "desc": "超限模式：天马座空间站",
+    },
+    "overlimit_mode_board_andromeda": {
+        "file": "overlimit_mode_board_andromeda.png",
+        "threshold": 0.86,
+        "roi": (400, 970, 700, 1160),
+        "desc": "超限模式：仙女座空间站",
+    },
+    "overlimit_mode_stage_page": {
+        "file": "overlimit_mode_stage_page.png",
+        "threshold": 0.86,
+        "roi": (60, 230, 400, 330),
+        "desc": "超限模式：空间站挑战详情",
+    },
+    "overlimit_mode_normal_cleared": {
+        "file": "overlimit_mode_normal_cleared.png",
+        "threshold": 0.94,
+        "roi": (200, 220, 430, 340),
+        "grayscale": False,
+        "desc": "超限模式：普通挑战已通关",
+    },
+    "overlimit_mode_challenge_ended": {
+        "file": "overlimit_mode_challenge_ended.png",
+        "threshold": 0.90,
+        "roi": (25, 505, 180, 560),
+        "grayscale": False,
+        "desc": "超限模式：当前挑战已截止",
+    },
+    "overlimit_mode_normal_challenge": {
+        "file": "overlimit_mode_normal_challenge.png",
+        "threshold": 0.86,
+        "roi": (80, 840, 300, 970),
+        "grayscale": False,
+        "desc": "超限模式：普通挑战按钮",
+    },
+    "overlimit_mode_overlimit_challenge": {
+        "file": "overlimit_mode_overlimit_challenge.png",
+        "threshold": 0.86,
+        "roi": (420, 840, 670, 970),
+        "grayscale": False,
+        "desc": "超限模式：超限挑战按钮",
+    },
+    "overlimit_mode_overlimit_dialog": {
+        "file": "overlimit_mode_overlimit_dialog.png",
+        "threshold": 0.86,
+        "roi": (240, 390, 480, 500),
+        "desc": "超限模式：超限挑战确认弹窗",
+    },
+    "overlimit_mode_start_challenge": {
+        "file": "overlimit_mode_start_challenge.png",
+        "threshold": 0.86,
+        "roi": (280, 750, 450, 880),
+        "grayscale": False,
+        "desc": "超限模式：确认弹窗挑战按钮",
+    },
+    "overlimit_mode_crystal_invalid": {
+        "file": "overlimit_mode_crystal_invalid.png",
+        "threshold": 0.90,
+        "roi": (250, 470, 520, 570),
+        "grayscale": False,
+        "desc": "超限模式：预设原晶失效弹窗标题",
+    },
+    "overlimit_mode_continue_battle": {
+        "file": "overlimit_mode_continue_battle.png",
+        "threshold": 0.90,
+        "roi": (400, 750, 610, 880),
+        "grayscale": False,
+        "desc": "超限模式：预设原晶失效弹窗继续战斗按钮",
+    },
+    "overlimit_mode_revive_close": {
+        "file": "overlimit_mode_revive_close.png",
+        "threshold": 0.90,
+        "roi": (550, 540, 660, 640),
+        "grayscale": False,
+        "desc": "超限模式坠机弹窗：关闭按钮",
+    },
+    "overlimit_mode_ad_revive": {
+        "file": "overlimit_mode_ad_revive.png",
+        "threshold": 0.90,
+        "roi": (400, 620, 580, 740),
+        "grayscale": False,
+        "desc": "超限模式坠机弹窗：广告复活按钮",
+    },
+    "overlimit_mode_result_continue": {
+        "file": "overlimit_mode_result_continue.png",
+        "threshold": 0.90,
+        "roi": (270, 1050, 450, 1190),
+        "grayscale": False,
+        "desc": "超限模式结算：继续按钮",
     },
 
     # ===== 无尽模式 =====

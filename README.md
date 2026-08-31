@@ -10,7 +10,7 @@
 
 - 自动执行常见日活流程，并按照固定顺序衔接各模块。
 - 支持兑换码、微信游戏圈、商城、体力、战队、夺宝和日常奖励领取。
-- 支持活动关卡、普通/英雄关卡扫荡、BOSS 模式及无尽模式。
+- 支持活动关卡、普通/英雄关卡扫荡、深空巡航、BOSS 模式、超限模式及无尽模式。
 - 支持背包装备合成、拆分和经验合成。
 - 提供可选的残骸资源出售功能，默认关闭，避免误售。
 - 自动调整并检查微信小程序窗口尺寸，保证模板与点击坐标一致。
@@ -49,26 +49,33 @@ cd lei-ting-zhan-ji-daily-auto
 
 ### 2. 安装依赖
 
-最简单的方式是双击：
+推荐使用 [uv](https://docs.astral.sh/uv/) 创建独立环境并安装依赖：
+
+```powershell
+uv venv .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+```
+
+也可以双击：
 
 ```text
 install_deps.bat
 ```
 
-也可以在 PowerShell 中安装：
+或直接使用 `pip`：
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-如果希望使用独立虚拟环境：
+`start_gui.bat` 检测到 `.venv` 后会优先使用其中的 Python。超限模式使用 `rapidocr-onnxruntime` 读取各空间站的挑战次数，该依赖已列入 `requirements.txt`。
+
+运行测试时另安装开发依赖：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+uv pip install --python .venv\Scripts\python.exe -r requirements-dev.txt
+.venv\Scripts\python.exe -m pytest -q
 ```
-
-`start_gui.bat` 检测到 `.venv` 后会优先使用其中的 Python。
 
 ### 3. 准备游戏窗口
 
@@ -87,7 +94,7 @@ start_gui.bat
 
 在“执行模块”中勾选本次需要完成的内容，然后点击“运行选中模块”。运行日志会直接显示在窗口下方。
 
-“背包空间处理（资源出售）”默认不启用。只有确认 `config.py` 中的出售范围符合自己的需求后，才应勾选该选项。
+“背包空间处理（资源出售）”默认不启用。只有确认 `config.py` 中的出售范围符合自己的需求后，才应勾选该选项。“深空巡航”和“超限模式”也默认不勾选，需要显式启用。
 
 ## 可用模块
 
@@ -104,7 +111,9 @@ start_gui.bat
 | 夺宝 | `treasure_hunt` | 领取和使用可用的免费夺宝机会 |
 | 活动关卡 | `event_stage` | 执行当前配置的活动关卡流程 |
 | 关卡扫荡 | `level_sweep` | 按配置扫荡普通和英雄关卡，并处理相关奖励 |
+| 深空巡航 | `deep_space_cruise` | 完成本期普通星域巡航后，进入真正的深空巡航页面并自动出击、结算及可选广告复活 |
 | BOSS 模式 | `boss_mode` | 根据当天日期选择板块并执行 BOSS 模式 |
+| 超限模式 | `overlimit_mode` | 按目标次数挑战各空间站，先解锁普通挑战再执行超限挑战，不启用付费 MAX 装备试用 |
 | 无尽模式 | `endless_mode` | 执行无尽模式世界竞赛及奖励领取 |
 | 日常奖励 | `daily_rewards` | 领取活跃度和首页可领取奖励 |
 
@@ -171,6 +180,19 @@ start_gui.bat
 
 配置为 `True` 并不会自动出售；还必须在 GUI 中勾选“资源出售”，或在命令行添加 `--enable-resource-sale`。首次使用前务必逐项检查，资源出售造成的物品消耗无法由脚本撤销。
 
+### 深空巡航与超限模式
+
+这两个模块目前是显式启用项：命令行默认流程不执行，GUI 初始也不勾选。建议先单独运行并观察。
+
+- `DEEP_SPACE_CRUISE_CONFIG.max_runs`：一次启动最多进行多少次真正的深空巡航出击。该入口只有在本期普通星域巡航全部完成后才会出现；未解锁时流程安全跳过。
+- 当前深空模块把普通星域巡航视为外部前置条件，不会在入口未出现时盲目挑战普通节点；真正深空所需的入口、页面、出击和规则弹窗模板必须先用真实窗口截图采集齐全，缺失时会在第一次点击前安全停止。
+- `OVERLIMIT_MODE_CONFIG.boards`：要处理的空间站。
+- `run_normal_challenge` / `run_overlimit_challenge`：是否执行普通挑战和超限挑战。
+- `target_runs_per_board`：目标聚合完成槽位数；普通挑战完成和超限挑战完成各占一个槽位。空间站选择页显示的“完成挑战 n/12”达到该值后跳过该站，范围为 `0..12`，默认值为 `2`。
+- 两个配置中的等待、超时和 `revive_by_ad` 分别控制战斗轮询与广告复活。
+
+超限模式不会点击需要资源的“试用[MAX]装备”入口，也不会点击钻石复活；广告不可用时会关闭已识别的复活弹窗。
+
 ### 模板与坐标
 
 `templates/`、`TEMPLATE_SPECS` 和固定坐标均基于目标窗口尺寸。只有在游戏界面更新、模板失效或主动更改窗口尺寸时，才需要调整这些内容。
@@ -188,7 +210,7 @@ python main.py
 只运行部分模块：
 
 ```powershell
-python main.py --sections shop,stamina,daily_rewards
+python main.py --sections deep_space_cruise,overlimit_mode
 ```
 
 使用可见窗口截图和真实点击：

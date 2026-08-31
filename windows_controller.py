@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -433,8 +434,32 @@ class WindowsController:
 
     # ---------- 点击与滑动 ----------
 
+    def _validate_client_point(self, x: float, y: float) -> tuple[int, int]:
+        """拒绝无法映射到客户区的坐标，避免错误点击被编码成合法消息。"""
+        try:
+            point_x = float(x)
+            point_y = float(y)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"客户区坐标必须是数字: ({x!r}, {y!r})") from exc
+        if not (math.isfinite(point_x) and math.isfinite(point_y)):
+            raise ValueError(f"客户区坐标必须是有限值: ({x!r}, {y!r})")
+        rounded_x = int(round(point_x))
+        rounded_y = int(round(point_y))
+        if not (
+            0 <= point_x < self.client_width
+            and 0 <= point_y < self.client_height
+            and 0 <= rounded_x < self.client_width
+            and 0 <= rounded_y < self.client_height
+        ):
+            raise ValueError(
+                f"客户区坐标越界: ({point_x:.1f}, {point_y:.1f})，"
+                f"有效范围为 0<=x<{self.client_width}, 0<=y<{self.client_height}"
+            )
+        return rounded_x, rounded_y
+
     def tap(self, x: float, y: float, delay: float = 0.8) -> None:
         self._ensure_client_size_before_interaction()
+        self._validate_client_point(x, y)
         if self.click_method == "message":
             ok = self._tap_by_message(x, y)
             if not ok:
@@ -455,7 +480,9 @@ class WindowsController:
 
     @staticmethod
     def _make_lparam(x: int, y: int) -> int:
-        return (y & 0xFFFF) << 16 | (x & 0xFFFF)
+        if not (0 <= x <= 0xFFFF and 0 <= y <= 0xFFFF):
+            raise ValueError(f"Windows 鼠标消息坐标越界: ({x}, {y})")
+        return y << 16 | x
 
     def _tap_by_message(self, x: float, y: float) -> bool:
         import win32api
@@ -495,6 +522,8 @@ class WindowsController:
         release_delay 表示移动到终点后到抬起鼠标前的等待时间。
         """
         self._ensure_client_size_before_interaction()
+        self._validate_client_point(x1, y1)
+        self._validate_client_point(x2, y2)
         if self.click_method == "message":
             ok = self._swipe_by_message(
                 x1,

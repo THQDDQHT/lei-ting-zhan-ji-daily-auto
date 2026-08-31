@@ -5,6 +5,8 @@ import logging
 import re
 import time
 from datetime import datetime
+from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +24,8 @@ from config import (
     TOOLBOX_CLIENT_HEIGHT,
     TOOLBOX_CLIENT_WIDTH,
     DEFAULT_FORCE_CLIENT_SIZE,
+    DEEP_SPACE_CRUISE_CONFIG,
+    OVERLIMIT_MODE_CONFIG,
     LEVEL_SWEEP_PLAN,
     RESOURCE_SALE_WRECKS,
     POSITION_SPECS,
@@ -33,6 +37,13 @@ from config import (
     TEMPLATE_SPECS,
 )
 from vision import TemplateMatcher, MatchResult
+
+
+class BattleResult(str, Enum):
+    VICTORY = "victory"
+    DEFEAT = "defeat"
+    # 只表示结算继续按钮已确认；未匹配到胜负模板时不能据此推断胜利。
+    COMPLETE = "complete"
 
 
 class DailyFlowRunner:
@@ -1229,6 +1240,800 @@ class DailyFlowRunner:
         self.back_to_home()
         logging.info("========== BOSS模式流程结束 ==========")
 
+    # ==================== 普通星域巡航 / 深空巡航 ====================
+
+    def _recover_to_home(self, context: str, max_steps: int = 6) -> bool:
+        """仅在识别到安全导航按钮时逐层返回首页。"""
+        for _ in range(max_steps):
+            shot = self.wait_until_not_loading(settle_seconds=0.2)
+            if self.match("home_challenge_mode", shot).found:
+                logging.info("%s：已回到首页", context)
+                return True
+            nav_home = self.match("nav_home", shot)
+            if nav_home.found:
+                self.ctrl.tap(nav_home.x, nav_home.y, delay=2.0)
+                continue
+            back = self.match("back", shot)
+            if back.found:
+                self.ctrl.tap(back.x, back.y, delay=1.5)
+                continue
+            logging.error("%s：当前页面没有可确认的安全返回按钮，停止点击", context)
+            return False
+        logging.error("%s：超过%d层仍未回到首页", context, max_steps)
+        return False
+
+    def _finish_mode_flow(
+        self,
+        context: str,
+        primary_error: Optional[BaseException],
+    ) -> None:
+        """结束模式流程并确认回到首页；保留主流程异常，不让恢复异常覆盖它。"""
+        try:
+            recovered = self._recover_to_home(context)
+        except Exception as recovery_error:
+            if primary_error is not None:
+                logging.error(
+                    "%s：异常恢复失败，保留原始异常：%s",
+                    context,
+                    recovery_error,
+                )
+                return
+            raise RuntimeError(f"{context}：恢复首页时发生异常") from recovery_error
+
+        if recovered:
+            return
+        if primary_error is not None:
+            logging.error("%s：异常后未能确认回到首页，保留原始异常", context)
+            return
+        raise RuntimeError(f"{context}：流程结束但未能确认回到首页")
+
+    @staticmethod
+    def _require_template_files(names: tuple[str, ...]) -> None:
+        """在开始点击前检查模式所需模板存在且可解码，避免流程中途才中断。"""
+        missing: list[str] = []
+        for name in names:
+            spec = TEMPLATE_SPECS.get(name)
+            if spec is None:
+                missing.append(f"{name}（未配置）")
+                continue
+            template_path = TEMPLATE_DIR / str(spec["file"])
+            if not template_path.is_file():
+                missing.append(f"{name}（{template_path.name}）")
+                continue
+            try:
+                image = TemplateMatcher._read_image(template_path, grayscale=False)
+            except Exception as exc:
+                logging.debug("模板预检读取失败 %s: %s", template_path, exc)
+                missing.append(f"{name}（{template_path.name}无法解码）")
+                continue
+            if image.size == 0:
+                missing.append(f"{name}（{template_path.name}为空）")
+        if missing:
+            raise RuntimeError("缺少或无效的模式模板，已在点击前停止：" + "、".join(missing))
+
+    @staticmethod
+    def _validate_battle_wait_config(config: dict, context: str) -> None:
+        initial_wait = float(config["initial_wait_seconds"])
+        poll_interval = float(config["poll_interval_seconds"])
+        timeout = float(config["battle_timeout_seconds"])
+        if initial_wait < 0 or poll_interval <= 0 or timeout <= 0 or initial_wait >= timeout:
+            raise ValueError(
+                f"{context}战斗等待参数必须满足 "
+                "0 <= initial_wait < timeout 且 poll_interval > 0"
+            )
+
+    def _click_first_available_cruise_enemy(self) -> bool:
+        shot = self.wait_until_not_loading(settle_seconds=0.3)
+        candidates: list[MatchResult] = []
+        for name in (
+            "expedition_available_enemy",
+            "expedition_available_enemy_right",
+        ):
+            result = self.match(name, shot)
+            if result.found:
+                candidates.append(result)
+
+        if not candidates:
+            logging.info("普通星域巡航：当前地图没有识别到可挑战敌人")
+            return False
+
+        target = max(candidates, key=lambda item: item.score)
+        logging.info(
+            "普通星域巡航：选择可挑战敌人 at (%.1f, %.1f), score=%.3f",
+            target.x,
+            target.y,
+            target.score,
+        )
+        self.ctrl.tap(target.x, target.y, delay=1.8)
+        # 敌机与推荐战力是动态内容；通用挑战按钮才是可靠的详情页标志。
+        return self.recognize_template(
+            "expedition_challenge",
+            required=False,
+            settle_seconds=0.3,
+        ).found
+
+    @staticmethod
+    def _sleep_with_deadline(seconds: float, deadline: float) -> bool:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(seconds, remaining))
+        return time.monotonic() < deadline
+
+    def _classify_battle_result(
+        self,
+        shot: Path,
+        *,
+        victory_template: Optional[str],
+        defeat_template: Optional[str],
+    ) -> BattleResult:
+        if defeat_template and self.match(defeat_template, shot).found:
+            return BattleResult.DEFEAT
+        if victory_template and self.match(victory_template, shot).found:
+            return BattleResult.VICTORY
+        return BattleResult.COMPLETE
+
+    def _wait_for_mode_battle_result(
+        self,
+        *,
+        context: str,
+        result_template: str,
+        revive_template: str,
+        revive_close_template: str,
+        initial_wait: float,
+        poll_interval: float,
+        timeout: float,
+        revive_by_ad: bool,
+        victory_template: Optional[str] = None,
+        defeat_template: Optional[str] = None,
+    ) -> BattleResult:
+        if initial_wait < 0 or poll_interval <= 0 or timeout <= 0 or initial_wait >= timeout:
+            raise ValueError(
+                "战斗等待参数必须满足 0 <= initial_wait < timeout 且 poll_interval > 0"
+            )
+
+        logging.info("%s：等待战斗结束", context)
+        deadline = time.monotonic() + timeout
+        if initial_wait and not self._sleep_with_deadline(initial_wait, deadline):
+            self.screenshot(f"{context}_timeout")
+            raise RuntimeError(f"{context}：{timeout:.0f}秒内未进入结算页")
+        revive_attempts = 0
+
+        while time.monotonic() < deadline:
+            shot = self.screenshot(f"{context}_battle_poll")
+            result = self.match(result_template, shot)
+            if result.found:
+                battle_result = self._classify_battle_result(
+                    shot,
+                    victory_template=victory_template,
+                    defeat_template=defeat_template,
+                )
+                logging.info("%s：检测到结算继续按钮，结果=%s", context, battle_result.value)
+                self.ctrl.tap(result.x, result.y, delay=2.4)
+                return battle_result
+
+            revive = self.match(revive_template, shot)
+            if revive.found:
+                if revive_by_ad and revive_attempts < 4:
+                    revive_attempts += 1
+                    logging.info("%s：第%d次使用广告复活", context, revive_attempts)
+                    self.ctrl.tap(revive.x, revive.y, delay=2.0)
+                    if not self._sleep_with_deadline(42.0, deadline):
+                        break
+                    post_ad = self.screenshot(f"{context}_post_ad")
+                    post_ad_result = self.match(result_template, post_ad)
+                    if post_ad_result.found:
+                        battle_result = self._classify_battle_result(
+                            post_ad,
+                            victory_template=victory_template,
+                            defeat_template=defeat_template,
+                        )
+                        logging.info(
+                            "%s：广告等待期间战斗已结束，结果=%s",
+                            context,
+                            battle_result.value,
+                        )
+                        self.ctrl.tap(post_ad_result.x, post_ad_result.y, delay=2.4)
+                        return battle_result
+                    # 复活弹窗后方仍能匹配 HUD，模态弹窗必须先于背景状态判断。
+                    if self.match(revive_template, post_ad).found:
+                        logging.warning("%s：广告复活未生效，停止重复观看并关闭复活弹窗", context)
+                        close_result = self.match(revive_close_template, post_ad)
+                        if not close_result.found:
+                            raise RuntimeError(f"{context}：广告复活未生效且未识别到关闭按钮")
+                        self.ctrl.tap(close_result.x, close_result.y, delay=3.0)
+                        revive_attempts = 4
+                        continue
+                    if self.match("high_energy_bomb", post_ad).found:
+                        logging.info("%s：广告复活后已返回战斗", context)
+                        continue
+
+                    raise RuntimeError(
+                        f"{context}：广告结束后的页面无法确认，停止点击以避免误触未知控件"
+                    )
+
+                close_result = self.match(revive_close_template, shot)
+                if not close_result.found:
+                    raise RuntimeError(f"{context}：检测到复活弹窗但未识别到关闭按钮")
+                logging.info("%s：关闭复活弹窗；不点击钻石复活", context)
+                self.ctrl.tap(close_result.x, close_result.y, delay=3.0)
+                continue
+
+            logging.info("%s：战斗尚未结束，%.1f秒后继续检测", context, poll_interval)
+            if not self._sleep_with_deadline(poll_interval, deadline):
+                break
+
+        self.screenshot(f"{context}_timeout")
+        raise RuntimeError(f"{context}：{timeout:.0f}秒内未进入结算页")
+
+    def _choose_cruise_equation_if_needed(self) -> bool:
+        equation_page = self.recognize_template(
+            "expedition_equation_page",
+            required=False,
+            settle_seconds=0.8,
+        )
+        if not equation_page.found:
+            return False
+
+        logging.info("普通星域巡航：选择中间增益方程")
+        # 三张方程卡的内容和立绘会随战斗变化，固定点击中间卡片比模板匹配稳定。
+        self.ctrl.tap(360, 650, delay=0.8)
+        self.ctrl.tap(360, 977, delay=2.0)
+        if self.recognize_template(
+            "expedition_equation_page",
+            required=False,
+            settle_seconds=0.2,
+        ).found:
+            raise RuntimeError("普通星域巡航：选择增益方程后页面未关闭")
+        return True
+
+    def _start_expedition_endless_battle(self, run_index: int) -> bool:
+        sortie = self.click_template(
+            "deep_space_cruise_sortie",
+            required=False,
+            tap_delay=3.0,
+        )
+        if not sortie.found:
+            logging.info("深空巡航：当前没有可用的出击按钮，停止后续出击")
+            return False
+        battle_result = self._wait_for_mode_battle_result(
+            context=f"深空巡航第{run_index}次出击",
+            result_template="cruise_result_continue",
+            revive_template="cruise_ad_revive",
+            revive_close_template="cruise_revive_close",
+            initial_wait=float(DEEP_SPACE_CRUISE_CONFIG["initial_wait_seconds"]),
+            poll_interval=float(DEEP_SPACE_CRUISE_CONFIG["poll_interval_seconds"]),
+            timeout=float(DEEP_SPACE_CRUISE_CONFIG["battle_timeout_seconds"]),
+            revive_by_ad=bool(DEEP_SPACE_CRUISE_CONFIG["revive_by_ad"]),
+            victory_template="cruise_result_victory",
+            defeat_template="cruise_result_defeat",
+        )
+        logging.info("深空巡航第%d次出击：结算结果=%s", run_index, battle_result.value)
+        if battle_result is not BattleResult.VICTORY:
+            logging.warning(
+                "深空巡航第%d次出击：未确认胜利，停止后续出击",
+                run_index,
+            )
+            return False
+        self.recognize_template("deep_space_cruise_page")
+        return True
+
+    def run_deep_space_cruise_flow(self) -> None:
+        logging.info("========== 深空巡航流程开始 ==========")
+        self._validate_battle_wait_config(DEEP_SPACE_CRUISE_CONFIG, "深空巡航")
+        max_runs = int(DEEP_SPACE_CRUISE_CONFIG["max_runs"])
+        if max_runs < 1:
+            raise ValueError("DEEP_SPACE_CRUISE_CONFIG.max_runs 必须大于 0")
+        self._require_template_files(
+            (
+                "loading",
+                "home_challenge_mode",
+                "challenge_deep_space_cruise",
+                "expedition_page",
+                "deep_space_cruise_entry",
+                "deep_space_cruise_page",
+                "deep_space_cruise_sortie",
+                "deep_space_cruise_info_close",
+                "cruise_result_continue",
+                "cruise_result_victory",
+                "cruise_result_defeat",
+                "cruise_ad_revive",
+                "cruise_revive_close",
+                "high_energy_bomb",
+                "nav_home",
+                "back",
+            )
+        )
+        primary_error: Optional[BaseException] = None
+        try:
+            self.click_template("home_challenge_mode")
+            self.click_template("challenge_deep_space_cruise")
+            self.recognize_template("expedition_page")
+
+            # Button-ExpeditionEndless 只在本期普通星域巡航全部完成后出现。
+            entry = self.click_template(
+                "deep_space_cruise_entry",
+                required=False,
+                tap_delay=2.5,
+            )
+            if not entry.found:
+                logging.warning("深空巡航：本期普通星域巡航尚未完成，入口未解锁，安全跳过")
+            else:
+                # 账号首次进入时会自动弹出规则页；只关闭已识别到的弹窗。
+                self.click_template(
+                    "deep_space_cruise_info_close",
+                    required=False,
+                    tap_delay=1.5,
+                    settle_seconds=0.5,
+                )
+                self.recognize_template("deep_space_cruise_page")
+
+                for run_index in range(1, max_runs + 1):
+                    if not self._start_expedition_endless_battle(run_index):
+                        break
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            self._finish_mode_flow("深空巡航", primary_error)
+        logging.info("========== 深空巡航流程结束 ==========")
+
+    # ==================== 超限模式 ====================
+
+    @staticmethod
+    def _overlimit_board_name(board: str) -> str:
+        names = {
+            "draco": "天龙座",
+            "cygnus": "白鸟座",
+            "pegasus": "天马座",
+            "andromeda": "仙女座",
+        }
+        if board not in names:
+            raise ValueError(f"未知超限模式空间站: {board}")
+        return names[board]
+
+    def _wait_for_overlimit_battle_start(
+        self,
+        *,
+        context: str,
+        allow_crystal_popup: bool,
+        allow_force_confirm: bool = False,
+        timeout: float = 15.0,
+    ) -> bool:
+        """点击挑战后只等待已确认的弹窗或战斗 HUD，禁止未知页面盲点。"""
+        if timeout <= 0:
+            raise ValueError("超限模式战斗启动等待时间必须大于 0")
+        deadline = time.monotonic() + timeout
+        force_confirm_clicked = False
+        partial_crystal_logged = False
+        while time.monotonic() < deadline:
+            shot = self.screenshot(f"{context}_start_poll")
+            if self.match("overlimit_mode_challenge_ended", shot).found:
+                logging.warning("%s：检测到挑战已截止", context)
+                return False
+
+            if allow_crystal_popup:
+                crystal_invalid = self.match("overlimit_mode_crystal_invalid", shot)
+                continue_battle = self.match("overlimit_mode_continue_battle", shot)
+                if crystal_invalid.found and continue_battle.found:
+                    logging.info("%s：预设包含失效原晶，按当前预设继续", context)
+                    # 同一截图同时确认标题和按钮后才允许点击，避开下方付费试用区。
+                    self.ctrl.tap(continue_battle.x, continue_battle.y, delay=3.0)
+                    return True
+                if (crystal_invalid.found or continue_battle.found) and not partial_crystal_logged:
+                    logging.warning("%s：原晶弹窗尚未完整渲染，继续等待", context)
+                    partial_crystal_logged = True
+                    if not self._sleep_with_deadline(0.4, deadline):
+                        break
+                    continue
+
+            # 低战力确认弹窗是模态层；即使其背景仍能匹配战斗 HUD，也必须先处理弹窗。
+            if allow_force_confirm:
+                force_confirm = self.match("expedition_force_challenge_confirm", shot)
+                if force_confirm.found:
+                    if not force_confirm_clicked:
+                        logging.info("%s：检测到低战力确认，点击无资源消耗的确认按钮", context)
+                        self.ctrl.tap(force_confirm.x, force_confirm.y, delay=2.0)
+                        force_confirm_clicked = True
+                    else:
+                        logging.info("%s：低战力确认弹窗仍在显示，继续等待其关闭", context)
+                    if not self._sleep_with_deadline(0.2, deadline):
+                        break
+                    continue
+
+            if self.match("high_energy_bomb", shot).found:
+                logging.info("%s：检测到战斗 HUD", context)
+                return True
+
+            if not self._sleep_with_deadline(0.5, deadline):
+                break
+
+        return False
+
+    def _run_overlimit_battle(self, *, board: str, challenge: str) -> bool:
+        board_name = self._overlimit_board_name(board)
+        challenge_name = "普通挑战" if challenge == "normal" else "超限挑战"
+        if challenge not in {"normal", "overlimit"}:
+            raise ValueError(f"未知超限模式挑战类型: {challenge}")
+        context = f"超限模式{board_name}{challenge_name}"
+        logging.info("%s：开始", context)
+
+        self.click_template(f"overlimit_mode_{challenge}_challenge", tap_delay=1.5)
+        if challenge == "normal":
+            if not self._wait_for_overlimit_battle_start(
+                context=context,
+                allow_crystal_popup=False,
+                allow_force_confirm=True,
+            ):
+                logging.warning("%s：点击后未进入战斗，停止等待结算", context)
+                return False
+        else:
+            self.recognize_template("overlimit_mode_overlimit_dialog")
+            # 只点击主挑战按钮；不触碰下方需消耗资源的 MAX 装备试用。
+            self.click_template("overlimit_mode_start_challenge", tap_delay=2.0)
+            if not self._wait_for_overlimit_battle_start(
+                context=context,
+                allow_crystal_popup=True,
+            ):
+                raise RuntimeError(f"{context}：点击挑战后未进入战斗或原晶提示")
+
+        battle_result = self._wait_for_mode_battle_result(
+            context=context,
+            result_template="overlimit_mode_result_continue",
+            revive_template="overlimit_mode_ad_revive",
+            revive_close_template="overlimit_mode_revive_close",
+            initial_wait=float(OVERLIMIT_MODE_CONFIG["initial_wait_seconds"]),
+            poll_interval=float(OVERLIMIT_MODE_CONFIG["poll_interval_seconds"]),
+            timeout=float(OVERLIMIT_MODE_CONFIG["battle_timeout_seconds"]),
+            revive_by_ad=bool(OVERLIMIT_MODE_CONFIG["revive_by_ad"]),
+            defeat_template="cruise_result_defeat",
+        )
+        logging.info("%s：结算结果=%s", context, battle_result.value)
+        if battle_result is BattleResult.DEFEAT:
+            logging.warning("%s：确认失败，不进入下一轮", context)
+            return False
+        if battle_result is BattleResult.COMPLETE:
+            logging.warning(
+                "%s：未识别胜负，后续仅允许由稳定完成槽位增长确认进度",
+                context,
+            )
+        self.recognize_template("overlimit_mode_stage_page")
+        logging.info("%s：完成", context)
+        return True
+
+    @staticmethod
+    def _overlimit_board_count_roi(board: str) -> tuple[int, int, int, int]:
+        rois = {
+            "draco": (120, 535, 285, 590),
+            "cygnus": (450, 685, 620, 740),
+            "pegasus": (115, 945, 285, 1000),
+            "andromeda": (435, 1080, 610, 1135),
+        }
+        if board not in rois:
+            raise ValueError(f"未知超限模式空间站: {board}")
+        return rois[board]
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _get_ocr_engine():
+        """延迟初始化 OCR，避免每个空间站重复加载 ONNX 模型。"""
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            return None
+        return RapidOCR()
+
+    @classmethod
+    def _read_challenge_count_from_image(
+        cls,
+        screenshot_path: Path,
+        roi: tuple[int, int, int, int],
+    ) -> Optional[int]:
+        """从“完成挑战：n/12”区域读取计数；OCR 不可用或结果冲突时返回 None。"""
+        engine = cls._get_ocr_engine()
+        if engine is None:
+            return None
+
+        image = TemplateMatcher._read_image(screenshot_path, grayscale=False)
+        x1, y1, x2, y2 = roi
+        height, width = image.shape[:2]
+        if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+            return None
+        crop = image[y1:y2, x1:x2]
+        result, _ = engine(crop)
+        texts: list[str] = []
+        candidates: list[tuple[int, float]] = []
+        for item in result or []:
+            if len(item) < 2:
+                continue
+            text = str(item[1])
+            texts.append(text)
+            try:
+                confidence = float(item[2]) if len(item) > 2 else 0.0
+            except (TypeError, ValueError):
+                continue
+            if confidence < 0.80:
+                continue
+            for match in re.finditer(r"(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})(?!\d)", text):
+                count = int(match.group(1))
+                total = int(match.group(2))
+                if 0 <= count <= total <= 12:
+                    candidates.append((count, confidence))
+
+        # 标题和计数有时会落在相邻文本框中；只有所有相关文本置信度足够时才拼接。
+        if not candidates and texts and (result or []):
+            confidences = []
+            for item in result or []:
+                if len(item) < 3:
+                    continue
+                try:
+                    confidences.append(float(item[2]))
+                except (TypeError, ValueError):
+                    pass
+            if confidences and min(confidences) >= 0.80:
+                joined = " ".join(texts)
+                for match in re.finditer(
+                    r"(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})(?!\d)",
+                    joined,
+                ):
+                    count = int(match.group(1))
+                    total = int(match.group(2))
+                    if 0 <= count <= total <= 12:
+                        candidates.append((count, min(confidences)))
+
+        if not candidates:
+            return None
+        best_confidence = max(confidence for _, confidence in candidates)
+        best_counts = {
+            count
+            for count, confidence in candidates
+            if confidence >= best_confidence - 0.05
+        }
+        if len(best_counts) != 1:
+            return None
+        return next(iter(best_counts))
+
+    def _get_overlimit_board_count(
+        self,
+        board: str,
+        shot: Optional[Path] = None,
+        confirm: bool = True,
+    ) -> Optional[int]:
+        """读取并确认空间站完成槽位计数，避免单帧 OCR 误触发挑战。"""
+        first_shot = shot or self.screenshot(f"overlimit_{board}_count")
+        roi = self._overlimit_board_count_roi(board)
+        first_count = self._read_challenge_count_from_image(first_shot, roi)
+        if confirm and first_count is not None:
+            time.sleep(0.15)
+            second_shot = self.screenshot(f"overlimit_{board}_count_confirm")
+            second_count = self._read_challenge_count_from_image(second_shot, roi)
+            if second_count != first_count:
+                logging.warning(
+                    "超限模式%s：连续两帧完成挑战次数不一致，安全跳过",
+                    self._overlimit_board_name(board),
+                )
+                return None
+        count = first_count
+        if count is None:
+            logging.warning("超限模式%s：无法读取完成挑战次数", self._overlimit_board_name(board))
+        else:
+            logging.info("超限模式%s：当前完成挑战%d（聚合完成槽位）", self._overlimit_board_name(board), count)
+        return count
+
+    def _return_to_overlimit_board_page(self) -> bool:
+        """从空间站详情返回选择页；没有明确页面标志时不点击。"""
+        if self.recognize_template(
+            "overlimit_mode_page",
+            required=False,
+            settle_seconds=0.2,
+        ).found:
+            return True
+        if not self.recognize_template(
+            "overlimit_mode_stage_page",
+            required=False,
+            settle_seconds=0.2,
+        ).found:
+            return False
+        if not self.click_template("back", required=False, tap_delay=1.5).found:
+            return False
+        return self.recognize_template(
+            "overlimit_mode_page",
+            required=False,
+            settle_seconds=0.2,
+        ).found
+
+    def run_overlimit_mode_board(
+        self,
+        board: str,
+        count_before: Optional[int] = None,
+    ) -> Optional[int]:
+        """按聚合完成槽位计数逐轮处理一个空间站，未增长时立即停止。"""
+        board_name = self._overlimit_board_name(board)
+        target_runs = int(OVERLIMIT_MODE_CONFIG["target_runs_per_board"])
+        if target_runs < 0 or target_runs > 12:
+            raise ValueError("OVERLIMIT_MODE_CONFIG.target_runs_per_board 必须在 0..12")
+        logging.info("超限模式：进入%s空间站", board_name)
+
+        if count_before is None:
+            count_before = self._get_overlimit_board_count(board)
+        if count_before is None:
+            logging.warning("超限模式：无法确认%s挑战次数，安全跳过", board_name)
+            return None
+        if count_before >= target_runs:
+            logging.info(
+                "超限模式%s：当前完成挑战%d，已达到目标%d",
+                board_name,
+                count_before,
+                target_runs,
+            )
+            return count_before
+
+        current_count = count_before
+        stage_open = False
+        primary_error: Optional[BaseException] = None
+        try:
+            while current_count < target_runs:
+                if not stage_open:
+                    entry = self.click_template(
+                        f"overlimit_mode_board_{board}",
+                        required=False,
+                        tap_delay=2.0,
+                    )
+                    if not entry.found:
+                        logging.info("超限模式：未识别到%s空间站，跳过", board_name)
+                        return current_count
+                    if not self.recognize_template("overlimit_mode_stage_page").found:
+                        return current_count
+                    stage_open = True
+
+                normal_cleared = self.recognize_template(
+                    "overlimit_mode_normal_cleared",
+                    required=False,
+                    settle_seconds=0.2,
+                ).found
+                if normal_cleared:
+                    logging.info("超限模式%s空间站：普通挑战已通关", board_name)
+                    challenge = "overlimit"
+                    if not bool(OVERLIMIT_MODE_CONFIG["run_overlimit_challenge"]):
+                        logging.info("超限模式%s：已关闭超限挑战，停止", board_name)
+                        return current_count
+                else:
+                    challenge = "normal"
+                    if not bool(OVERLIMIT_MODE_CONFIG["run_normal_challenge"]):
+                        logging.warning(
+                            "超限模式%s空间站：普通挑战未通关且已关闭普通挑战，停止",
+                            board_name,
+                        )
+                        return current_count
+
+                if not self._run_overlimit_battle(board=board, challenge=challenge):
+                    logging.warning("超限模式%s：%s未能启动，停止本站后续挑战", board_name, challenge)
+                    return current_count
+
+                if not self._return_to_overlimit_board_page():
+                    raise RuntimeError(
+                        f"超限模式{board_name}：战斗后未能确认回到空间站选择页"
+                    )
+                stage_open = False
+                count_after = self._get_overlimit_board_count(board)
+                if count_after is None:
+                    logging.warning("超限模式%s：战斗后无法确认完成槽位变化，停止", board_name)
+                    return current_count
+                if count_after < current_count:
+                    raise RuntimeError(f"超限模式{board_name}：挑战次数异常回退")
+                if count_after == current_count:
+                    logging.warning("超限模式%s：本轮完成槽位未增加，停止避免重复消耗", board_name)
+                    return current_count
+                current_count = count_after
+
+            return current_count
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if stage_open:
+                try:
+                    returned = self._return_to_overlimit_board_page()
+                except Exception as recovery_error:
+                    if primary_error is None:
+                        raise RuntimeError(
+                            f"超限模式{board_name}：退出空间站详情时发生异常"
+                        ) from recovery_error
+                    logging.error(
+                        "超限模式%s：异常恢复失败，保留原始异常：%s",
+                        board_name,
+                        recovery_error,
+                    )
+                else:
+                    if not returned:
+                        if primary_error is None:
+                            raise RuntimeError(f"超限模式{board_name}：退出空间站详情失败")
+                        logging.error(
+                            "超限模式%s：异常后未能退出空间站详情，保留原始异常",
+                            board_name,
+                        )
+
+    def run_overlimit_mode_flow(self) -> None:
+        logging.info("========== 超限模式流程开始 ==========")
+        self._validate_battle_wait_config(OVERLIMIT_MODE_CONFIG, "超限模式")
+        target_runs = int(OVERLIMIT_MODE_CONFIG["target_runs_per_board"])
+        if target_runs < 0 or target_runs > 12:
+            raise ValueError("OVERLIMIT_MODE_CONFIG.target_runs_per_board 必须在 0..12")
+        if target_runs == 0:
+            logging.info("超限模式：目标完成槽位为0，跳过全部挑战")
+            return
+        boards = tuple(str(board) for board in OVERLIMIT_MODE_CONFIG["boards"])
+        for board in boards:
+            self._overlimit_board_name(board)
+        template_names = [
+            "loading",
+            "home_challenge_mode",
+            "challenge_boss_mode",
+            "boss_mode_overlimit_entry",
+            "overlimit_mode_page",
+            "overlimit_mode_stage_page",
+            "overlimit_mode_normal_cleared",
+            "overlimit_mode_challenge_ended",
+            "overlimit_mode_result_continue",
+            "cruise_result_defeat",
+            "overlimit_mode_ad_revive",
+            "overlimit_mode_revive_close",
+            "high_energy_bomb",
+            "nav_home",
+            "back",
+        ]
+        template_names.extend(
+            f"overlimit_mode_board_{str(board)}"
+            for board in OVERLIMIT_MODE_CONFIG["boards"]
+        )
+        if bool(OVERLIMIT_MODE_CONFIG["run_normal_challenge"]):
+            template_names.extend(
+                (
+                    "overlimit_mode_normal_challenge",
+                    "expedition_force_challenge_confirm",
+                )
+            )
+        if bool(OVERLIMIT_MODE_CONFIG["run_overlimit_challenge"]):
+            template_names.extend(
+                (
+                    "overlimit_mode_overlimit_challenge",
+                    "overlimit_mode_overlimit_dialog",
+                    "overlimit_mode_start_challenge",
+                    "overlimit_mode_crystal_invalid",
+                    "overlimit_mode_continue_battle",
+                )
+            )
+        self._require_template_files(tuple(template_names))
+        primary_error: Optional[BaseException] = None
+        try:
+            self.click_template("home_challenge_mode")
+            self.click_template("challenge_boss_mode")
+            entry = self.click_template("boss_mode_overlimit_entry", required=False, tap_delay=2.0)
+            if not entry.found:
+                logging.info("超限模式：当前活动入口不存在，结束流程")
+            else:
+                self.recognize_template("overlimit_mode_page")
+
+                for board in boards:
+                    count = self._get_overlimit_board_count(board)
+                    # 计数不可读时安全跳过，避免重复消耗挑战次数和广告。
+                    if count is None:
+                        continue
+                    if count >= target_runs:
+                        logging.info(
+                            "超限模式%s：已达到目标%d个完成槽位，本次跳过",
+                            self._overlimit_board_name(board),
+                            target_runs,
+                        )
+                        continue
+                    self.run_overlimit_mode_board(board, count_before=count)
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            self._finish_mode_flow("超限模式", primary_error)
+        logging.info("========== 超限模式流程结束 ==========")
+
     # ==================== 无尽模式 ====================
 
     def wait_and_claim_endless_reward(
@@ -1358,7 +2163,9 @@ class DailyFlowRunner:
             ("event_stage", self.run_event_stage_flow),
             ("level_sweep", self.run_level_sweep_flow),
             ("backpack", self.run_resource_sale_only_flow),
+            ("deep_space_cruise", self.run_deep_space_cruise_flow),
             ("boss_mode", self.run_boss_mode_flow),
+            ("overlimit_mode", self.run_overlimit_mode_flow),
             ("endless_mode", self.run_endless_mode_flow),
             ("backpack", self.run_equipment_synthesis_and_split_flow),
             ("daily_rewards", self.run_daily_rewards_flow),
@@ -1404,7 +2211,9 @@ def parse_sections(value: str) -> list[str]:
         "treasure_hunt",
         "event_stage",
         "level_sweep",
+        "deep_space_cruise",
         "boss_mode",
+        "overlimit_mode",
         "endless_mode",
         "daily_rewards",
     }
@@ -1486,7 +2295,7 @@ def parse_args() -> argparse.Namespace:
         "--sections",
         type=parse_sections,
         default=parse_sections("redemption_code,game_circle,decade_reunion,shop,interstellar,stamina,team,backpack,treasure_hunt,event_stage,level_sweep,boss_mode,endless_mode,daily_rewards"),
-        help="选择执行模块，用逗号分隔；执行顺序由总流程固定。可选：redemption_code,game_circle,decade_reunion,shop,interstellar,stamina,team,backpack,treasure_hunt,event_stage,level_sweep,boss_mode,endless_mode,daily_rewards。默认全部执行",
+        help="选择执行模块，用逗号分隔；执行顺序由总流程固定。可选：redemption_code,game_circle,decade_reunion,shop,interstellar,stamina,team,backpack,treasure_hunt,event_stage,level_sweep,deep_space_cruise,boss_mode,overlimit_mode,endless_mode,daily_rewards。深空巡航和超限模式默认不执行，需显式选择",
     )
     parser.add_argument("--list-windows", action="store_true", help="精确列出配置中的游戏窗口后退出")
     return parser.parse_args()

@@ -56,7 +56,9 @@ SECTION_ITEMS = [
     ("treasure_hunt", "夺宝"),
     ("event_stage", "活动关卡"),
     ("level_sweep", "关卡扫荡"),
+    ("deep_space_cruise", "深空巡航"),
     ("boss_mode", "BOSS模式"),
+    ("overlimit_mode", "超限模式"),
     ("endless_mode", "无尽模式"),
     ("daily_rewards", "消息、活跃度、奖励领取"),
 ]
@@ -164,7 +166,11 @@ class App(tk.Tk):
         self.swipe_duration = tk.DoubleVar(value=0.5)
         self.swipe_press_delay = tk.DoubleVar(value=0.1)
         self.swipe_release_delay = tk.DoubleVar(value=0.5)
-        self.sections_vars = {key: tk.BooleanVar(value=True) for key, _ in SECTION_ITEMS}
+        opt_in_sections = {"deep_space_cruise", "overlimit_mode"}
+        self.sections_vars = {
+            key: tk.BooleanVar(value=key not in opt_in_sections)
+            for key, _ in SECTION_ITEMS
+        }
         self.template_image_path = tk.StringVar(value="")
         self.template_names = list(TEMPLATE_SPECS.keys())
         self.template_sort_by_score = tk.BooleanVar(value=True)

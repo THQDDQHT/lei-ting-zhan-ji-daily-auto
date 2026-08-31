@@ -35,7 +35,11 @@ class TemplateMatcher:
     @staticmethod
     def _read_image(path: str | Path, grayscale: bool) -> np.ndarray:
         path = Path(path)
-        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        try:
+            data = np.fromfile(path, dtype=np.uint8)
+        except OSError as exc:
+            raise FileNotFoundError(f"图片读取失败: {path}") from exc
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if img is None:
             raise FileNotFoundError(f"图片读取失败: {path}")
         if grayscale:
@@ -58,10 +62,10 @@ class TemplateMatcher:
             return img, 0, 0
         x1, y1, x2, y2 = roi
         h, w = img.shape[:2]
-        x1 = max(0, min(x1, w - 1))
-        y1 = max(0, min(y1, h - 1))
-        x2 = max(x1 + 1, min(x2, w))
-        y2 = max(y1 + 1, min(y2, h))
+        if not (0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h):
+            raise ValueError(
+                f"ROI 越界或为空: {roi}，图像尺寸为 {w}x{h}"
+            )
         return img[y1:y2, x1:x2], x1, y1
 
     def match(
