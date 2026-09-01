@@ -1615,12 +1615,12 @@ TEMPLATE_SPECS = {
         "grayscale": False,
         "desc": "超限模式：普通挑战已通关",
     },
-    "overlimit_mode_challenge_ended": {
+    "overlimit_mode_ranking_closed": {
         "file": "overlimit_mode_challenge_ended.png",
         "threshold": 0.90,
         "roi": (25, 505, 180, 560),
         "grayscale": False,
-        "desc": "超限模式：当前挑战已截止",
+        "desc": "超限模式：排行榜已截止（仍可挑战领奖）",
     },
     "overlimit_mode_normal_challenge": {
         "file": "overlimit_mode_normal_challenge.png",

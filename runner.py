@@ -2453,12 +2453,16 @@ class DailyFlowRunner:
         deadline = time.monotonic() + timeout
         force_confirm_clicked = False
         crystal_continue_clicked = False
+        ranking_closed_logged = False
         partial_crystal_logged = False
         while time.monotonic() < deadline:
             shot = self.screenshot(f"{context}_start_poll")
-            if self.match("overlimit_mode_challenge_ended", shot).found:
-                logging.warning("%s：检测到挑战已截止", context)
-                return False
+            if (
+                self.match("overlimit_mode_ranking_closed", shot).found
+                and not ranking_closed_logged
+            ):
+                logging.info("%s：排行榜已截止，但奖励挑战仍开放，继续", context)
+                ranking_closed_logged = True
 
             if allow_crystal_popup:
                 crystal_invalid = self.match("overlimit_mode_crystal_invalid", shot)
@@ -2665,10 +2669,10 @@ class DailyFlowRunner:
         return "".join(texts)
 
     def _get_overlimit_stage_status(self, shot: Optional[Path] = None) -> Optional[str]:
-        """返回 incomplete/normal_cleared/overlimit_cleared/ended；未知则返回 None。"""
+        """返回 incomplete/normal_cleared/overlimit_cleared；未知则返回 None。"""
         current = shot or self.screenshot("overlimit_stage_status")
-        if self.match("overlimit_mode_challenge_ended", current).found:
-            return "ended"
+        if self.match("overlimit_mode_ranking_closed", current).found:
+            logging.info("超限模式：排行榜已截止，奖励挑战仍可继续")
 
         header = self._read_overlimit_stage_header(current)
         if "超限通关" in header:
@@ -2888,10 +2892,6 @@ class DailyFlowRunner:
                 while expected_count < target_runs and attempts < 2:
                     status_shot = self.wait_until_not_loading(settle_seconds=0.3)
                     status = self._get_overlimit_stage_status(status_shot)
-                    if status == "ended":
-                        logging.warning("超限模式%s：活动挑战已截止", board_name)
-                        stop_board = True
-                        break
                     if status is None:
                         stop_board = True
                         break
@@ -3016,7 +3016,7 @@ class DailyFlowRunner:
             "overlimit_mode_stage_prev",
             "overlimit_mode_stage_next",
             "overlimit_mode_normal_cleared",
-            "overlimit_mode_challenge_ended",
+            "overlimit_mode_ranking_closed",
             "overlimit_mode_normal_challenge",
             "overlimit_mode_overlimit_challenge",
             "overlimit_mode_result_continue",

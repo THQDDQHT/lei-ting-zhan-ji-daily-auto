@@ -1103,6 +1103,26 @@ def test_overlimit_stage_status_uses_header_ocr(
     assert flow._get_overlimit_stage_status(Path("stage.png")) == expected
 
 
+def test_overlimit_ranking_closed_does_not_block_reward_challenge(
+    flow: DailyFlowRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        flow,
+        "_read_overlimit_stage_header",
+        lambda _shot: "猎杀原型体未完成挑战",
+    )
+    monkeypatch.setattr(
+        flow,
+        "match",
+        lambda name, _shot: result(
+            name == "overlimit_mode_ranking_closed"
+        ),
+    )
+
+    assert flow._get_overlimit_stage_status(Path("ranking-closed.png")) == "incomplete"
+
+
 def test_overlimit_board_scans_all_boss_stages(
     flow: DailyFlowRunner,
     monkeypatch: pytest.MonkeyPatch,
@@ -1184,7 +1204,7 @@ def test_overlimit_crystal_continue_waits_for_battle_hud(
     monkeypatch.setattr(flow, "_sleep_with_deadline", lambda *_args: True)
 
     def match(name: str, shot: Path) -> MatchResult:
-        if name == "overlimit_mode_challenge_ended":
+        if name == "overlimit_mode_ranking_closed":
             return result(False)
         if name in {
             "overlimit_mode_crystal_invalid",
@@ -1205,6 +1225,30 @@ def test_overlimit_crystal_continue_waits_for_battle_hud(
     assert flow.ctrl.taps == [(510, 820, 3.0)]
 
 
+def test_overlimit_ranking_closed_still_waits_for_battle_hud(
+    flow: DailyFlowRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shots = iter([Path("ranking-closed.png"), Path("battle.png")])
+    monkeypatch.setattr(flow, "screenshot", lambda _tag: next(shots))
+    monkeypatch.setattr(flow, "_sleep_with_deadline", lambda *_args: True)
+
+    def match(name: str, shot: Path) -> MatchResult:
+        if name == "overlimit_mode_ranking_closed":
+            return result(shot.name == "ranking-closed.png")
+        if name == "high_energy_bomb":
+            return result(shot.name == "battle.png")
+        return result(False)
+
+    monkeypatch.setattr(flow, "match", match)
+
+    assert flow._wait_for_overlimit_battle_start(
+        context="排行榜截止后继续挑战测试",
+        allow_crystal_popup=False,
+        timeout=1.0,
+    )
+
+
 def test_force_confirm_modal_wins_over_background_hud(
     flow: DailyFlowRunner,
     monkeypatch: pytest.MonkeyPatch,
@@ -1215,7 +1259,7 @@ def test_force_confirm_modal_wins_over_background_hud(
     monkeypatch.setattr(flow, "_sleep_with_deadline", lambda _seconds, _deadline: True)
 
     def match(name: str, shot: Path) -> MatchResult:
-        if name == "overlimit_mode_challenge_ended":
+        if name == "overlimit_mode_ranking_closed":
             return result(False)
         if name == "expedition_force_challenge_confirm":
             return result(shot.name == "force_confirm.png", x=470, y=700)
@@ -1818,7 +1862,7 @@ def test_overlimit_preflight_checks_force_confirm_before_click(
         "overlimit_mode_stage_prev",
         "overlimit_mode_stage_next",
         "overlimit_mode_normal_cleared",
-        "overlimit_mode_challenge_ended",
+        "overlimit_mode_ranking_closed",
         "overlimit_mode_result_continue",
         "cruise_result_defeat",
         "overlimit_mode_ad_revive",
