@@ -28,24 +28,119 @@ TOOLBOX_CLIENT_WIDTH = 414
 TOOLBOX_CLIENT_HEIGHT = 780
 DEFAULT_FORCE_CLIENT_SIZE = True
 
+# 巡航/超限共用的 Windows 战斗辅助。所有坐标均基于 720x1280 客户区。
+# 护盾优先；爆弹每条命最多一次且有较长冷却；钻石复活只接受连续两帧识别到 40。
+BATTLE_ASSIST_CONFIG = {
+    "enabled": True,
+    "action_poll_seconds": 1.0,
+    "shield_enabled": True,
+    "shield_position": (639, 1096),
+    "shield_retry_seconds": 10.0,
+    "shield_protection_seconds": 5.0,
+    "bomb_enabled": True,
+    "bomb_initial_delay_seconds": 18.0,
+    "bomb_min_interval_seconds": 45.0,
+    "max_bombs_per_life": 1,
+    "move_enabled": True,
+    "move_initial_delay_seconds": 3.0,
+    "move_interval_seconds": 5.0,
+    "move_duration_seconds": 0.30,
+    "move_positions": ((360, 980), (170, 980), (550, 980)),
+    "revive_by_40_diamonds": True,
+    "allowed_diamond_revive_costs": (40,),
+    "revive_cost_roi": (250, 610, 470, 760),
+    "diamond_revive_position": (360, 700),
+    "max_paid_revives_per_battle": 1,
+}
+
+# 普通巡航节点详情页的战机选择。OCR 无法可靠读取战力时保留当前战机。
+CRUISE_FIGHTER_CONFIG = {
+    "enabled": True,
+    "change_fighter_position": (111, 991),
+    "fighter_list_roi": (0, 740, 720, 1000),
+    "sortie_position": (360, 1026),
+    "close_position": (662, 181),
+    "list_wait_seconds": 0.8,
+    "minimum_power": 1000,
+    "maximum_power": 999999,
+}
+
 # 关卡扫荡配置。
 # sweeps 表示该关卡扫荡几次；double_rewards 表示该关前几次扫荡领取广告双倍奖励。
-# 深空巡航配置。真正深空巡航需要先完成当期普通星域巡航；本流程将其视为外部前置，未解锁时安全跳过。
+# 深空巡航配置。先自动完成当期普通星域巡航，再进入真正的深空巡航。
 DEEP_SPACE_CRUISE_CONFIG = {
+    "complete_normal_cruise": True,
+    # 普通星域巡航共 3 章，每章 7 个普通节点 + 1 个 BOSS，24 是完整周期的安全上限。
+    "normal_max_battles": 24,
+    # 普通巡航优先品质；深空巡航在 OCR 可用时优先攻略关键方程，再比较品质。
+    "normal_equation_pick_strategy": "highest_quality",
+    "deep_equation_pick_strategy": "priority",
+    # 三张动态卡牌的识别范围、点击中心和下方确认按钮，均基于 720x1280 客户区。
+    "equation_card_rois": (
+        (0, 410, 240, 890),
+        (240, 410, 480, 890),
+        (480, 410, 720, 890),
+    ),
+    "equation_card_centers": ((120, 650), (360, 650), (600, 650)),
+    "equation_confirm_position": (360, 977),
+    "equation_fallback_card_index": 1,
+    # 受击流兼顾普通挂机的优先表；前面的词条优先级更高。
+    "equation_priority_keywords": (
+        "检修面板",
+        "检修模板",
+        "方程重置",
+        "反转装置",
+        "狂暴协议",
+        "拆解协议",
+        "维修回路",
+        "强力结构",
+        "精炼模块",
+        "晶化装甲",
+        "虹吸模块",
+        "自动基站",
+        "协同模块",
+        "组装模块",
+        "稳态过载",
+        "转化模块",
+        "升级催化",
+        "高效模块",
+        "震荡催化",
+        "无双指令",
+        "烈性炸药",
+    ),
+    # 方程页可能连续弹出多次；超过上限说明页面没有正常关闭，停止继续点击。
+    "max_equation_picks_per_pause": 40,
     "max_runs": 1,
     "initial_wait_seconds": 30.0,
     "poll_interval_seconds": 5.0,
-    "battle_timeout_seconds": 480.0,
+    # 普通节点数分钟内应结束；深空 333 波可能持续很久，分别设置超时。
+    "normal_battle_timeout_seconds": 480.0,
+    "battle_timeout_seconds": 7200.0,
     "revive_by_ad": True,
 }
 
-# 超限模式配置。普通挑战优先解锁关卡；超限挑战不启用消耗资源的 MAX 装备试用。
-# target_runs_per_board 表示该空间站要达到的聚合完成槽位数：普通/超限各占一个槽位。
+# 超限模式配置。四个空间站分别达到 9/12 后停止，后三个目标不管。
+# 超限挑战使用 200 钻 MAX 装备试用；付费前后都要连续两帧确认。
 OVERLIMIT_MODE_CONFIG = {
     "boards": ("draco", "cygnus", "pegasus", "andromeda"),
     "run_normal_challenge": True,
     "run_overlimit_challenge": True,
-    "target_runs_per_board": 2,
+    "target_runs_per_board": 9,
+    # 每个空间站有 6 个 BOSS，每个 BOSS 各有普通、超限两个完成槽位。
+    "stages_per_board": 6,
+    "stage_header_roi": (0, 210, 520, 350),
+    "use_max_equipment_trial": True,
+    "max_equipment_trial_expected_cost": 200,
+    "max_equipment_trial_min_confidence": 0.90,
+    "max_equipment_trial_label_roi": (40, 930, 490, 1010),
+    "max_equipment_trial_cost_roi": (500, 930, 680, 1015),
+    "max_equipment_trial_prompt_roi": (50, 470, 670, 610),
+    "max_equipment_trial_confirm_frames": 2,
+    "max_equipment_trial_poll_seconds": 0.35,
+    "max_equipment_trial_confirm_timeout_seconds": 6.0,
+    "max_equipment_trial_point_tolerance": 25.0,
+    # 从 0/12 补到 9/12 每站最多有 4 次超限挑战，四站总计最多 16 次。
+    "max_equipment_trial_purchase_attempt_limit": 16,
     "initial_wait_seconds": 12.0,
     "poll_interval_seconds": 5.0,
     "battle_timeout_seconds": 240.0,
@@ -1346,9 +1441,9 @@ TEMPLATE_SPECS = {
     "expedition_available_enemy": {
         "file": "expedition_available_enemy.png",
         "threshold": 0.90,
-        "roi": (20, 620, 170, 770),
+        "roi": (0, 300, 720, 1120),
         "grayscale": False,
-        "desc": "普通星域巡航地图左下：动态节点视觉模板",
+        "desc": "普通星域巡航地图：任意可挑战节点的蓝色目标台",
     },
     "expedition_available_enemy_right": {
         "file": "expedition_available_enemy_right.png",
@@ -1427,15 +1522,15 @@ TEMPLATE_SPECS = {
     },
     "deep_space_cruise_entry": {
         "file": "deep_space_cruise_entry.png",
-        "threshold": 0.82,
+        "threshold": 0.78,
         "roi": (80, 500, 640, 860),
         "grayscale": False,
         "desc": "普通星域巡航完成后：真正深空巡航入口",
     },
     "deep_space_cruise_page": {
         "file": "deep_space_cruise_page.png",
-        "threshold": 0.82,
-        "roi": (120, 200, 600, 520),
+        "threshold": 0.78,
+        "roi": (100, 40, 620, 230),
         "grayscale": False,
         "desc": "真正深空巡航页面静态标志",
     },
@@ -1497,7 +1592,21 @@ TEMPLATE_SPECS = {
         "file": "overlimit_mode_stage_page.png",
         "threshold": 0.86,
         "roi": (60, 230, 400, 330),
-        "desc": "超限模式：空间站挑战详情",
+        "desc": "超限模式：特定未完成 BOSS 标题（兼容旧模板）",
+    },
+    "overlimit_mode_stage_prev": {
+        "file": "boss_mode_difficulty_prev.png",
+        "threshold": 0.84,
+        "roi": (0, 400, 100, 900),
+        "grayscale": False,
+        "desc": "超限模式：上一个 BOSS 黄色左箭头",
+    },
+    "overlimit_mode_stage_next": {
+        "file": "overlimit_mode_stage_next.png",
+        "threshold": 0.84,
+        "roi": (620, 400, 720, 900),
+        "grayscale": False,
+        "desc": "超限模式：下一个 BOSS 黄色右箭头",
     },
     "overlimit_mode_normal_cleared": {
         "file": "overlimit_mode_normal_cleared.png",
@@ -1537,7 +1646,8 @@ TEMPLATE_SPECS = {
         "file": "overlimit_mode_start_challenge.png",
         "threshold": 0.86,
         "roi": (280, 750, 450, 880),
-        "grayscale": False,
+        # 真实 MAX 购买前后弹窗会改变周边色彩，灰度匹配更稳定。
+        "grayscale": True,
         "desc": "超限模式：确认弹窗挑战按钮",
     },
     "overlimit_mode_crystal_invalid": {

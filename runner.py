@@ -4,11 +4,14 @@ import argparse
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
+
+import cv2
 
 from windows_controller import WindowsController
 from config import (
@@ -24,6 +27,8 @@ from config import (
     TOOLBOX_CLIENT_HEIGHT,
     TOOLBOX_CLIENT_WIDTH,
     DEFAULT_FORCE_CLIENT_SIZE,
+    BATTLE_ASSIST_CONFIG,
+    CRUISE_FIGHTER_CONFIG,
     DEEP_SPACE_CRUISE_CONFIG,
     OVERLIMIT_MODE_CONFIG,
     LEVEL_SWEEP_PLAN,
@@ -46,6 +51,28 @@ class BattleResult(str, Enum):
     COMPLETE = "complete"
 
 
+@dataclass
+class BattleAssistState:
+    """单场战斗内的动作节流状态；付费次数跨复活保留。"""
+
+    life_started_at: float
+    last_shield_at: Optional[float] = None
+    last_bomb_at: Optional[float] = None
+    last_move_at: Optional[float] = None
+    move_index: int = 0
+    bombs_used_this_life: int = 0
+    paid_revives_used: int = 0
+    battle_confirmed: bool = False
+
+    def reset_for_revive(self, now: float) -> None:
+        self.life_started_at = now
+        self.last_shield_at = None
+        self.last_move_at = None
+        self.move_index = 0
+        self.bombs_used_this_life = 0
+        self.battle_confirmed = False
+
+
 class DailyFlowRunner:
 
     def __init__(
@@ -64,6 +91,7 @@ class DailyFlowRunner:
         self.level_sweep_swept_count = 0
         self.level_sweep_periodic_reward_claimed = False
         self.level_sweep_double_reward_counts = {"normal": 0, "hero": 0}
+        self.overlimit_max_trial_purchase_attempts = 0
         self.sections = sections or [
             "redemption_code",
             "game_circle",
@@ -1360,6 +1388,219 @@ class DailyFlowRunner:
         time.sleep(min(seconds, remaining))
         return time.monotonic() < deadline
 
+    @staticmethod
+    def _validate_battle_assist_config(config: dict) -> None:
+        if not bool(config.get("enabled", False)):
+            return
+        for key in (
+            "action_poll_seconds",
+            "shield_retry_seconds",
+            "shield_protection_seconds",
+            "bomb_initial_delay_seconds",
+            "bomb_min_interval_seconds",
+            "move_initial_delay_seconds",
+            "move_interval_seconds",
+            "move_duration_seconds",
+        ):
+            if float(config[key]) < 0:
+                raise ValueError(f"战斗辅助配置 {key} 不能小于 0")
+        if float(config["action_poll_seconds"]) <= 0:
+            raise ValueError("战斗辅助 action_poll_seconds 必须大于 0")
+        if int(config["max_bombs_per_life"]) < 0:
+            raise ValueError("战斗辅助 max_bombs_per_life 不能小于 0")
+        if int(config["max_paid_revives_per_battle"]) < 0:
+            raise ValueError("战斗辅助 max_paid_revives_per_battle 不能小于 0")
+
+        positions = tuple(config["move_positions"])
+        if len(positions) < 2:
+            raise ValueError("战斗辅助 move_positions 至少需要两个位置")
+        points = (
+            config["shield_position"],
+            config["diamond_revive_position"],
+            *positions,
+        )
+        for point in points:
+            if len(point) != 2:
+                raise ValueError("战斗辅助坐标必须是二元坐标")
+            x, y = (int(value) for value in point)
+            if not (0 <= x < TARGET_CLIENT_WIDTH and 0 <= y < TARGET_CLIENT_HEIGHT):
+                raise ValueError(f"战斗辅助坐标越界: {point}")
+
+    def _perform_battle_actions(
+        self,
+        shot: Path,
+        state: BattleAssistState,
+        *,
+        now: float,
+        config: dict,
+    ) -> Optional[str]:
+        """确认 HUD 后，按护盾、爆弹、移动的优先级执行至多一个动作。"""
+        if not bool(config.get("enabled", False)):
+            return None
+        battle_hud = None
+        if not state.battle_confirmed:
+            battle_hud = self.match("high_energy_bomb", shot)
+            if not battle_hud.found:
+                return None
+            state.battle_confirmed = True
+            state.life_started_at = now
+
+        if bool(config.get("shield_enabled", True)):
+            shield_due = (
+                state.last_shield_at is None
+                or now - state.last_shield_at >= float(config["shield_retry_seconds"])
+            )
+            if shield_due:
+                x, y = (float(value) for value in config["shield_position"])
+                logging.info("战斗辅助：优先尝试开启护盾")
+                self.ctrl.tap(x, y, delay=0.1)
+                state.last_shield_at = now
+                return "shield"
+
+        if bool(config.get("bomb_enabled", True)):
+            bomb_due = (
+                state.bombs_used_this_life < int(config["max_bombs_per_life"])
+                and now - state.life_started_at
+                >= float(config["bomb_initial_delay_seconds"])
+                and (
+                    state.last_bomb_at is None
+                    or now - state.last_bomb_at
+                    >= float(config["bomb_min_interval_seconds"])
+                )
+                and (
+                    state.last_shield_at is None
+                    or now - state.last_shield_at
+                    >= float(config["shield_protection_seconds"])
+                )
+            )
+            if bomb_due:
+                if battle_hud is None:
+                    battle_hud = self.match("high_energy_bomb", shot)
+                if battle_hud.found:
+                    logging.info("战斗辅助：护盾保护期已结束，单次使用高能爆弹")
+                    self.ctrl.tap(battle_hud.x, battle_hud.y, delay=0.1)
+                    state.last_bomb_at = now
+                    state.bombs_used_this_life += 1
+                    return "bomb"
+
+        if bool(config.get("move_enabled", True)):
+            move_due = (
+                now - state.life_started_at >= float(config["move_initial_delay_seconds"])
+                if state.last_move_at is None
+                else now - state.last_move_at >= float(config["move_interval_seconds"])
+            )
+            if move_due:
+                positions = tuple(config["move_positions"])
+                start_index = state.move_index % len(positions)
+                target_index = (start_index + 1) % len(positions)
+                x1, y1 = (float(value) for value in positions[start_index])
+                x2, y2 = (float(value) for value in positions[target_index])
+                logging.info(
+                    "战斗辅助：横移战机 (%.0f, %.0f) -> (%.0f, %.0f)",
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                )
+                self.ctrl.swipe(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    duration=float(config["move_duration_seconds"]),
+                    press_delay=0.05,
+                    release_delay=0.05,
+                    delay=0.1,
+                )
+                state.move_index = target_index
+                state.last_move_at = now
+                return "move"
+
+        return None
+
+    def _read_revive_diamond_cost(self, shot: Path, config: dict) -> Optional[int]:
+        tokens = self._read_ocr_tokens(shot, tuple(config["revive_cost_roi"]))
+        costs: set[int] = set()
+        for text, confidence, _x, _y in tokens:
+            if confidence < 0.80:
+                continue
+            for match in re.finditer(r"(?<!\d)(20|40|60)(?!\d)", text):
+                costs.add(int(match.group(1)))
+        if len(costs) != 1:
+            return None
+        return next(iter(costs))
+
+    def _try_paid_revive(
+        self,
+        shot: Path,
+        state: BattleAssistState,
+        *,
+        now: float,
+        config: dict,
+        revive_close_template: str,
+    ) -> bool:
+        if not bool(config.get("revive_by_40_diamonds", False)):
+            return False
+        if state.paid_revives_used >= int(config["max_paid_revives_per_battle"]):
+            return False
+        cost = self._read_revive_diamond_cost(shot, config)
+        allowed = tuple(int(value) for value in config["allowed_diamond_revive_costs"])
+        if cost not in allowed or cost != 40:
+            logging.info("战斗辅助：复活价格=%r，不是精确的40钻，拒绝点击", cost)
+            return False
+
+        confirm_shot = self.screenshot("battle_assist_paid_revive_confirm")
+        if not self.match(revive_close_template, confirm_shot).found:
+            logging.warning("战斗辅助：第二帧未确认复活弹窗，拒绝钻石复活")
+            return False
+        confirm_cost = self._read_revive_diamond_cost(confirm_shot, config)
+        if confirm_cost != 40:
+            logging.warning(
+                "战斗辅助：两帧复活价格不一致（40 -> %r），拒绝钻石复活",
+                confirm_cost,
+            )
+            return False
+
+        x, y = (float(value) for value in config["diamond_revive_position"])
+        logging.info("战斗辅助：连续两帧确认价格40，使用一次钻石复活")
+        self.ctrl.tap(x, y, delay=2.0)
+        state.paid_revives_used += 1
+        state.reset_for_revive(now)
+        return True
+
+    def _wait_for_cruise_battle_start(
+        self,
+        *,
+        context: str,
+        timeout: float = 15.0,
+    ) -> bool:
+        """等待普通巡航进入战斗，并只处理已确认的低战力提示。"""
+        if timeout <= 0:
+            raise ValueError("普通星域巡航战斗启动等待时间必须大于 0")
+
+        deadline = time.monotonic() + timeout
+        force_confirm_clicked = False
+        while time.monotonic() < deadline:
+            shot = self.screenshot(f"{context}_start_poll")
+            force_confirm = self.match("expedition_force_challenge_confirm", shot)
+            if force_confirm.found:
+                if not force_confirm_clicked:
+                    logging.info("%s：检测到低战力提示，确认继续挑战", context)
+                    self.ctrl.tap(force_confirm.x, force_confirm.y, delay=2.0)
+                    force_confirm_clicked = True
+                if not self._sleep_with_deadline(0.2, deadline):
+                    break
+                continue
+
+            if self.match("high_energy_bomb", shot).found:
+                logging.info("%s：检测到战斗 HUD", context)
+                return True
+
+            if not self._sleep_with_deadline(0.5, deadline):
+                break
+
+        return False
+
     def _classify_battle_result(
         self,
         shot: Path,
@@ -1386,6 +1627,9 @@ class DailyFlowRunner:
         revive_by_ad: bool,
         victory_template: Optional[str] = None,
         defeat_template: Optional[str] = None,
+        handle_cruise_equations: bool = False,
+        cruise_equation_strategy: str = "priority",
+        battle_assist_config: Optional[dict] = None,
     ) -> BattleResult:
         if initial_wait < 0 or poll_interval <= 0 or timeout <= 0 or initial_wait >= timeout:
             raise ValueError(
@@ -1394,7 +1638,17 @@ class DailyFlowRunner:
 
         logging.info("%s：等待战斗结束", context)
         deadline = time.monotonic() + timeout
-        if initial_wait and not self._sleep_with_deadline(initial_wait, deadline):
+        assist_config = (
+            dict(battle_assist_config)
+            if battle_assist_config and bool(battle_assist_config.get("enabled", False))
+            else None
+        )
+        assist_state: Optional[BattleAssistState] = None
+        if assist_config is not None:
+            self._validate_battle_assist_config(assist_config)
+            assist_state = BattleAssistState(life_started_at=time.monotonic())
+            logging.info("%s：已启用护盾优先的战斗辅助", context)
+        elif initial_wait and not self._sleep_with_deadline(initial_wait, deadline):
             self.screenshot(f"{context}_timeout")
             raise RuntimeError(f"{context}：{timeout:.0f}秒内未进入结算页")
         revive_attempts = 0
@@ -1413,79 +1667,425 @@ class DailyFlowRunner:
                 return battle_result
 
             revive = self.match(revive_template, shot)
-            if revive.found:
+            close_result = self.match(revive_close_template, shot)
+            if revive.found or close_result.found:
                 if revive_by_ad and revive_attempts < 4:
-                    revive_attempts += 1
-                    logging.info("%s：第%d次使用广告复活", context, revive_attempts)
-                    self.ctrl.tap(revive.x, revive.y, delay=2.0)
-                    if not self._sleep_with_deadline(42.0, deadline):
-                        break
-                    post_ad = self.screenshot(f"{context}_post_ad")
-                    post_ad_result = self.match(result_template, post_ad)
-                    if post_ad_result.found:
-                        battle_result = self._classify_battle_result(
-                            post_ad,
-                            victory_template=victory_template,
-                            defeat_template=defeat_template,
-                        )
-                        logging.info(
-                            "%s：广告等待期间战斗已结束，结果=%s",
-                            context,
-                            battle_result.value,
-                        )
-                        self.ctrl.tap(post_ad_result.x, post_ad_result.y, delay=2.4)
-                        return battle_result
-                    # 复活弹窗后方仍能匹配 HUD，模态弹窗必须先于背景状态判断。
-                    if self.match(revive_template, post_ad).found:
-                        logging.warning("%s：广告复活未生效，停止重复观看并关闭复活弹窗", context)
-                        close_result = self.match(revive_close_template, post_ad)
-                        if not close_result.found:
-                            raise RuntimeError(f"{context}：广告复活未生效且未识别到关闭按钮")
-                        self.ctrl.tap(close_result.x, close_result.y, delay=3.0)
-                        revive_attempts = 4
-                        continue
-                    if self.match("high_energy_bomb", post_ad).found:
-                        logging.info("%s：广告复活后已返回战斗", context)
-                        continue
+                    if revive.found and close_result.found:
+                        revive_attempts += 1
+                        logging.info("%s：第%d次使用广告复活", context, revive_attempts)
+                        self.ctrl.tap(revive.x, revive.y, delay=2.0)
+                        if not self._sleep_with_deadline(42.0, deadline):
+                            break
+                        post_ad = self.screenshot(f"{context}_post_ad")
+                        post_ad_result = self.match(result_template, post_ad)
+                        if post_ad_result.found:
+                            battle_result = self._classify_battle_result(
+                                post_ad,
+                                victory_template=victory_template,
+                                defeat_template=defeat_template,
+                            )
+                            logging.info(
+                                "%s：广告等待期间战斗已结束，结果=%s",
+                                context,
+                                battle_result.value,
+                            )
+                            self.ctrl.tap(post_ad_result.x, post_ad_result.y, delay=2.4)
+                            return battle_result
+                        # 复活弹窗后方仍能匹配 HUD，模态弹窗必须先于背景状态判断。
+                        if self.match(revive_template, post_ad).found:
+                            logging.warning("%s：广告复活未生效，停止重复观看并关闭复活弹窗", context)
+                            post_close = self.match(revive_close_template, post_ad)
+                            if not post_close.found:
+                                raise RuntimeError(f"{context}：广告复活未生效且未识别到关闭按钮")
+                            self.ctrl.tap(post_close.x, post_close.y, delay=3.0)
+                            revive_attempts = 4
+                            continue
+                        if handle_cruise_equations:
+                            equation_count = self._choose_cruise_equations_if_needed(
+                                context=context,
+                                first_shot=post_ad,
+                                strategy=cruise_equation_strategy,
+                            )
+                            if equation_count:
+                                continue
+                        if self.match("high_energy_bomb", post_ad).found:
+                            logging.info("%s：广告复活后已返回战斗", context)
+                            if assist_state is not None:
+                                assist_state.reset_for_revive(time.monotonic())
+                            continue
 
-                    raise RuntimeError(
-                        f"{context}：广告结束后的页面无法确认，停止点击以避免误触未知控件"
-                    )
+                        raise RuntimeError(
+                            f"{context}：广告结束后的页面无法确认，停止点击以避免误触未知控件"
+                        )
 
-                close_result = self.match(revive_close_template, shot)
+                if (
+                    close_result.found
+                    and assist_state is not None
+                    and assist_config is not None
+                ):
+                    if self._try_paid_revive(
+                        shot,
+                        assist_state,
+                        now=time.monotonic(),
+                        config=assist_config,
+                        revive_close_template=revive_close_template,
+                    ):
+                        continue
                 if not close_result.found:
                     raise RuntimeError(f"{context}：检测到复活弹窗但未识别到关闭按钮")
-                logging.info("%s：关闭复活弹窗；不点击钻石复活", context)
+                logging.info("%s：关闭复活弹窗；不点击非40钻或超出次数的复活", context)
                 self.ctrl.tap(close_result.x, close_result.y, delay=3.0)
                 continue
 
-            logging.info("%s：战斗尚未结束，%.1f秒后继续检测", context, poll_interval)
-            if not self._sleep_with_deadline(poll_interval, deadline):
+            if handle_cruise_equations:
+                equation_count = self._choose_cruise_equations_if_needed(
+                    context=context,
+                    first_shot=shot,
+                    strategy=cruise_equation_strategy,
+                )
+                if equation_count:
+                    continue
+
+            if assist_state is not None and assist_config is not None:
+                self._perform_battle_actions(
+                    shot,
+                    assist_state,
+                    now=time.monotonic(),
+                    config=assist_config,
+                )
+                effective_poll = min(
+                    poll_interval,
+                    float(assist_config["action_poll_seconds"]),
+                )
+            else:
+                effective_poll = poll_interval
+            logging.info("%s：战斗尚未结束，%.1f秒后继续检测", context, effective_poll)
+            if not self._sleep_with_deadline(effective_poll, deadline):
                 break
 
         self.screenshot(f"{context}_timeout")
         raise RuntimeError(f"{context}：{timeout:.0f}秒内未进入结算页")
 
-    def _choose_cruise_equation_if_needed(self) -> bool:
-        equation_page = self.recognize_template(
-            "expedition_equation_page",
-            required=False,
-            settle_seconds=0.8,
+    @staticmethod
+    def _equation_quality_rank_from_hsv(crop) -> int:
+        """按卡面主色判断 V/IV/III/II 品质；无法确认时返回 0。"""
+        if crop.size == 0:
+            return 0
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hue = hsv[:, :, 0]
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+        visible = (saturation >= 90) & (value >= 75)
+        if int(visible.sum()) < 100:
+            return 0
+
+        color_counts = {
+            5: int((visible & (hue >= 8) & (hue <= 38)).sum()),
+            4: int((visible & (hue >= 125) & (hue <= 175)).sum()),
+            3: int((visible & (hue >= 85) & (hue < 125)).sum()),
+            2: int((visible & (hue >= 39) & (hue < 85)).sum()),
+        }
+        rank, count = max(color_counts.items(), key=lambda item: item[1])
+        return rank if count >= max(100, int(visible.sum() * 0.12)) else 0
+
+    @classmethod
+    def _read_equation_cards(
+        cls,
+        screenshot_path: Path,
+    ) -> list[tuple[str, int]]:
+        """读取三张方程卡的 OCR 文本和品质；OCR 不可用时仍返回颜色品质。"""
+        image = TemplateMatcher._read_image(screenshot_path, grayscale=False)
+        height, width = image.shape[:2]
+        rois = tuple(DEEP_SPACE_CRUISE_CONFIG["equation_card_rois"])
+        engine = cls._get_ocr_engine()
+        cards: list[tuple[str, int]] = []
+
+        for roi in rois:
+            x1, y1, x2, y2 = (int(value) for value in roi)
+            if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+                cards.append(("", 0))
+                continue
+            crop = image[y1:y2, x1:x2]
+            quality = cls._equation_quality_rank_from_hsv(crop)
+            texts: list[str] = []
+            if engine is not None:
+                result, _ = engine(crop)
+                for item in result or []:
+                    if len(item) < 2:
+                        continue
+                    try:
+                        confidence = float(item[2]) if len(item) > 2 else 0.0
+                    except (TypeError, ValueError):
+                        continue
+                    if confidence >= 0.65:
+                        texts.append(str(item[1]).replace(" ", ""))
+            cards.append(("".join(texts), quality))
+        return cards
+
+    @staticmethod
+    def _quality_rank_from_text(text: str) -> int:
+        normalized = text.upper().replace(" ", "")
+        for roman, rank in (("IV", 4), ("III", 3), ("II", 2), ("V", 5), ("I", 1)):
+            if roman in normalized:
+                return rank
+        return 0
+
+    def _select_equation_card_index(self, shot: Path, strategy: str) -> int:
+        if strategy not in {"highest_quality", "priority"}:
+            raise ValueError(f"未知方程选择策略: {strategy}")
+
+        centers = tuple(DEEP_SPACE_CRUISE_CONFIG["equation_card_centers"])
+        rois = tuple(DEEP_SPACE_CRUISE_CONFIG["equation_card_rois"])
+        fallback = int(DEEP_SPACE_CRUISE_CONFIG["equation_fallback_card_index"])
+        if len(centers) != 3 or len(rois) != 3 or fallback not in range(3):
+            raise ValueError("深空巡航方程卡配置必须包含三张卡，备用索引必须在 0..2")
+
+        cards = self._read_equation_cards(shot)
+        priorities = tuple(str(item) for item in DEEP_SPACE_CRUISE_CONFIG["equation_priority_keywords"])
+        scored: list[tuple[tuple[int, int, int], int]] = []
+        for index, (text, color_quality) in enumerate(cards):
+            text_quality = self._quality_rank_from_text(text)
+            quality = max(text_quality, color_quality)
+            keyword_score = 0
+            if strategy == "priority":
+                for keyword_index, keyword in enumerate(priorities):
+                    if keyword and keyword in text:
+                        keyword_score = len(priorities) - keyword_index
+                        break
+            center_bias = 1 if index == fallback else 0
+            scored.append(((keyword_score, quality, center_bias), index))
+
+        best_score, best_index = max(scored)
+        if best_score[:2] == (0, 0):
+            logging.warning("方程卡文字和品质均无法确认，使用备用第%d张", fallback + 1)
+            return fallback
+        logging.info(
+            "方程卡识别=%s，策略=%s，选择第%d张",
+            cards,
+            strategy,
+            best_index + 1,
         )
-        if not equation_page.found:
+        return best_index
+
+    @staticmethod
+    def _validate_cruise_equation_config() -> None:
+        strategies = {
+            str(DEEP_SPACE_CRUISE_CONFIG["normal_equation_pick_strategy"]),
+            str(DEEP_SPACE_CRUISE_CONFIG["deep_equation_pick_strategy"]),
+        }
+        invalid = strategies - {"highest_quality", "priority"}
+        if invalid:
+            raise ValueError(f"未知方程选择策略: {sorted(invalid)}")
+
+        rois = tuple(DEEP_SPACE_CRUISE_CONFIG["equation_card_rois"])
+        centers = tuple(DEEP_SPACE_CRUISE_CONFIG["equation_card_centers"])
+        fallback = int(DEEP_SPACE_CRUISE_CONFIG["equation_fallback_card_index"])
+        if len(rois) != 3 or len(centers) != 3 or fallback not in range(3):
+            raise ValueError("深空巡航方程卡配置必须包含三张卡，备用索引必须在 0..2")
+        for roi in rois:
+            if len(roi) != 4:
+                raise ValueError("每个方程卡 ROI 必须包含四个坐标")
+            x1, y1, x2, y2 = (int(value) for value in roi)
+            if not (
+                0 <= x1 < x2 <= TARGET_CLIENT_WIDTH
+                and 0 <= y1 < y2 <= TARGET_CLIENT_HEIGHT
+            ):
+                raise ValueError(f"方程卡 ROI 越界: {roi}")
+        for point in (*centers, DEEP_SPACE_CRUISE_CONFIG["equation_confirm_position"]):
+            if len(point) != 2:
+                raise ValueError("方程点击位置必须包含两个坐标")
+            x, y = (int(value) for value in point)
+            if not (0 <= x < TARGET_CLIENT_WIDTH and 0 <= y < TARGET_CLIENT_HEIGHT):
+                raise ValueError(f"方程点击位置越界: {point}")
+
+    def _choose_cruise_equations_if_needed(
+        self,
+        *,
+        context: str,
+        first_shot: Optional[Path] = None,
+        max_picks: Optional[int] = None,
+        strategy: str = "priority",
+    ) -> int:
+        """连续处理暂停战斗的方程三选一页面，返回本次选择次数。"""
+        if max_picks is None:
+            max_picks = int(DEEP_SPACE_CRUISE_CONFIG["max_equation_picks_per_pause"])
+        if max_picks < 1:
+            raise ValueError("DEEP_SPACE_CRUISE_CONFIG.max_equation_picks_per_pause 必须大于 0")
+
+        shot = first_shot or self.screenshot(f"{context}_equation_check")
+        selected = 0
+        while self.match("expedition_equation_page", shot).found:
+            if selected >= max_picks:
+                raise RuntimeError(
+                    f"{context}：连续出现超过{max_picks}次方程选择，停止点击"
+                )
+            selected += 1
+            card_index = self._select_equation_card_index(shot, strategy)
+            centers = tuple(DEEP_SPACE_CRUISE_CONFIG["equation_card_centers"])
+            card_x, card_y = (int(value) for value in centers[card_index])
+            confirm_x, confirm_y = (
+                int(value)
+                for value in DEEP_SPACE_CRUISE_CONFIG["equation_confirm_position"]
+            )
+            logging.info(
+                "%s：第%d次方程选择，点击第%d张卡",
+                context,
+                selected,
+                card_index + 1,
+            )
+            self.ctrl.tap(card_x, card_y, delay=0.8)
+            self.ctrl.tap(confirm_x, confirm_y, delay=1.5)
+            shot = self.screenshot(f"{context}_equation_after_{selected}")
+
+        return selected
+
+    def _choose_cruise_equation_if_needed(self) -> bool:
+        shot = self.wait_until_not_loading(settle_seconds=0.8)
+        return bool(
+            self._choose_cruise_equations_if_needed(
+                context="普通星域巡航",
+                first_shot=shot,
+                strategy=str(DEEP_SPACE_CRUISE_CONFIG["normal_equation_pick_strategy"]),
+            )
+        )
+
+    def _read_fighter_power_candidates(
+        self,
+        shot: Path,
+        config: dict,
+    ) -> list[tuple[int, float, float]]:
+        """从战机卡片行读取 (战力, 点击x, 点击y)，OCR 不可靠时返回空。"""
+        tokens = self._read_ocr_tokens(shot, tuple(config["fighter_list_roi"]))
+        minimum = int(config["minimum_power"])
+        maximum = int(config["maximum_power"])
+        candidates: list[tuple[int, float, float]] = []
+        for text, confidence, x, y in tokens:
+            if confidence < 0.78:
+                continue
+            numbers = [int(value) for value in re.findall(r"(?<!\d)(\d{4,6})(?!\d)", text)]
+            for power in numbers:
+                if minimum <= power <= maximum:
+                    candidates.append((power, x, y))
+
+        # OCR 可能把同一卡片的“巡航战力”和数字拆成两行；按横坐标近邻去重。
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        unique: list[tuple[int, float, float]] = []
+        for candidate in candidates:
+            if any(abs(candidate[1] - existing[1]) < 25 for existing in unique):
+                continue
+            unique.append(candidate)
+        return unique
+
+    def _select_best_cruise_fighter(self, config: dict) -> bool:
+        """在普通巡航详情页选择 OCR 可确认的最高战力战机。"""
+        if not bool(config.get("enabled", False)):
+            return True
+        change_x, change_y = (float(value) for value in config["change_fighter_position"])
+        self.ctrl.tap(
+            change_x,
+            change_y,
+            delay=float(config["list_wait_seconds"]),
+        )
+        shot = self.screenshot("cruise_fighter_list")
+        candidates = self._read_fighter_power_candidates(shot, config)
+        if not candidates:
+            logging.warning("普通星域巡航：未可靠识别战机战力，保留当前战机")
+            close_x, close_y = (float(value) for value in config["close_position"])
+            self.ctrl.tap(close_x, close_y, delay=0.8)
+            return self.recognize_template(
+                "expedition_challenge",
+                required=False,
+                settle_seconds=0.3,
+            ).found
+
+        power, card_x, card_y = max(candidates, key=lambda item: item[0])
+        logging.info("普通星域巡航：选择已识别最高战力战机 %d", power)
+        self.ctrl.tap(card_x, card_y, delay=0.5)
+        sortie_x, sortie_y = (float(value) for value in config["sortie_position"])
+        self.ctrl.tap(sortie_x, sortie_y, delay=1.2)
+        confirmed = self.recognize_template(
+            "expedition_challenge",
+            required=False,
+            settle_seconds=0.3,
+        ).found
+        if not confirmed:
+            logging.error("普通星域巡航：更换战机后未确认回到详情页")
+        return confirmed
+
+    def _run_normal_cruise_battle(self, battle_index: int) -> bool:
+        context = f"普通星域巡航第{battle_index}场"
+        if not self._click_first_available_cruise_enemy():
             return False
 
-        logging.info("普通星域巡航：选择中间增益方程")
-        # 三张方程卡的内容和立绘会随战斗变化，固定点击中间卡片比模板匹配稳定。
-        self.ctrl.tap(360, 650, delay=0.8)
-        self.ctrl.tap(360, 977, delay=2.0)
+        if not self._select_best_cruise_fighter(CRUISE_FIGHTER_CONFIG):
+            logging.warning("%s：无法安全确认战机选择结果", context)
+            return False
+
+        self.click_template("expedition_challenge", tap_delay=1.5)
+        if not self._wait_for_cruise_battle_start(context=context):
+            logging.warning("%s：点击挑战后未确认进入战斗", context)
+            return False
+
+        battle_result = self._wait_for_mode_battle_result(
+            context=context,
+            result_template="cruise_result_continue",
+            revive_template="cruise_ad_revive",
+            revive_close_template="cruise_revive_close",
+            initial_wait=float(DEEP_SPACE_CRUISE_CONFIG["initial_wait_seconds"]),
+            poll_interval=float(DEEP_SPACE_CRUISE_CONFIG["poll_interval_seconds"]),
+            timeout=float(DEEP_SPACE_CRUISE_CONFIG["normal_battle_timeout_seconds"]),
+            revive_by_ad=bool(DEEP_SPACE_CRUISE_CONFIG["revive_by_ad"]),
+            victory_template="cruise_result_victory",
+            defeat_template="cruise_result_defeat",
+            handle_cruise_equations=True,
+            cruise_equation_strategy=str(
+                DEEP_SPACE_CRUISE_CONFIG["normal_equation_pick_strategy"]
+            ),
+            battle_assist_config=BATTLE_ASSIST_CONFIG,
+        )
+        logging.info("%s：结算结果=%s", context, battle_result.value)
+        if battle_result is not BattleResult.VICTORY:
+            logging.warning("%s：未确认胜利，停止普通星域巡航", context)
+            return False
+
+        equation_shot = self.wait_until_not_loading(settle_seconds=0.8)
+        equation_count = self._choose_cruise_equations_if_needed(
+            context=context,
+            first_shot=equation_shot,
+            strategy=str(DEEP_SPACE_CRUISE_CONFIG["normal_equation_pick_strategy"]),
+        )
+        if equation_count:
+            logging.info("%s：已处理%d次方程选择", context, equation_count)
+        self.recognize_template("expedition_page")
+        return True
+
+    def _complete_normal_cruise(self) -> bool:
+        max_battles = int(DEEP_SPACE_CRUISE_CONFIG["normal_max_battles"])
+        if max_battles < 1:
+            raise ValueError("DEEP_SPACE_CRUISE_CONFIG.normal_max_battles 必须大于 0")
+
+        for battle_index in range(1, max_battles + 1):
+            if self.recognize_template(
+                "deep_space_cruise_entry",
+                required=False,
+                settle_seconds=0.2,
+            ).found:
+                logging.info("普通星域巡航：已完成，深空巡航入口已解锁")
+                return True
+            if not self._run_normal_cruise_battle(battle_index):
+                logging.warning("普通星域巡航：没有可继续确认的挑战，停止自动推进")
+                return False
+
         if self.recognize_template(
-            "expedition_equation_page",
+            "deep_space_cruise_entry",
             required=False,
             settle_seconds=0.2,
         ).found:
-            raise RuntimeError("普通星域巡航：选择增益方程后页面未关闭")
-        return True
+            logging.info("普通星域巡航：已完成，深空巡航入口已解锁")
+            return True
+        raise RuntimeError(
+            f"普通星域巡航：已达到安全上限{max_battles}场，但深空巡航入口仍未出现"
+        )
 
     def _start_expedition_endless_battle(self, run_index: int) -> bool:
         sortie = self.click_template(
@@ -1507,6 +2107,11 @@ class DailyFlowRunner:
             revive_by_ad=bool(DEEP_SPACE_CRUISE_CONFIG["revive_by_ad"]),
             victory_template="cruise_result_victory",
             defeat_template="cruise_result_defeat",
+            handle_cruise_equations=True,
+            cruise_equation_strategy=str(
+                DEEP_SPACE_CRUISE_CONFIG["deep_equation_pick_strategy"]
+            ),
+            battle_assist_config=BATTLE_ASSIST_CONFIG,
         )
         logging.info("深空巡航第%d次出击：结算结果=%s", run_index, battle_result.value)
         if battle_result is not BattleResult.VICTORY:
@@ -1521,29 +2126,54 @@ class DailyFlowRunner:
     def run_deep_space_cruise_flow(self) -> None:
         logging.info("========== 深空巡航流程开始 ==========")
         self._validate_battle_wait_config(DEEP_SPACE_CRUISE_CONFIG, "深空巡航")
+        self._validate_battle_assist_config(BATTLE_ASSIST_CONFIG)
+        self._validate_cruise_equation_config()
         max_runs = int(DEEP_SPACE_CRUISE_CONFIG["max_runs"])
         if max_runs < 1:
             raise ValueError("DEEP_SPACE_CRUISE_CONFIG.max_runs 必须大于 0")
-        self._require_template_files(
-            (
-                "loading",
-                "home_challenge_mode",
-                "challenge_deep_space_cruise",
-                "expedition_page",
-                "deep_space_cruise_entry",
-                "deep_space_cruise_page",
-                "deep_space_cruise_sortie",
-                "deep_space_cruise_info_close",
-                "cruise_result_continue",
-                "cruise_result_victory",
-                "cruise_result_defeat",
-                "cruise_ad_revive",
-                "cruise_revive_close",
-                "high_energy_bomb",
-                "nav_home",
-                "back",
+        max_equation_picks = int(DEEP_SPACE_CRUISE_CONFIG["max_equation_picks_per_pause"])
+        if max_equation_picks < 1:
+            raise ValueError("DEEP_SPACE_CRUISE_CONFIG.max_equation_picks_per_pause 必须大于 0")
+        if bool(DEEP_SPACE_CRUISE_CONFIG["complete_normal_cruise"]):
+            normal_max_battles = int(DEEP_SPACE_CRUISE_CONFIG["normal_max_battles"])
+            if normal_max_battles < 1:
+                raise ValueError("DEEP_SPACE_CRUISE_CONFIG.normal_max_battles 必须大于 0")
+            normal_timeout = float(
+                DEEP_SPACE_CRUISE_CONFIG["normal_battle_timeout_seconds"]
             )
-        )
+            initial_wait = float(DEEP_SPACE_CRUISE_CONFIG["initial_wait_seconds"])
+            if normal_timeout <= initial_wait:
+                raise ValueError("普通星域巡航超时必须大于首次等待时间")
+
+        template_names = [
+            "loading",
+            "home_challenge_mode",
+            "challenge_deep_space_cruise",
+            "expedition_page",
+            "expedition_equation_page",
+            "deep_space_cruise_entry",
+            "deep_space_cruise_page",
+            "deep_space_cruise_sortie",
+            "deep_space_cruise_info_close",
+            "cruise_result_continue",
+            "cruise_result_victory",
+            "cruise_result_defeat",
+            "cruise_ad_revive",
+            "cruise_revive_close",
+            "high_energy_bomb",
+            "nav_home",
+            "back",
+        ]
+        if bool(DEEP_SPACE_CRUISE_CONFIG["complete_normal_cruise"]):
+            template_names.extend(
+                (
+                    "expedition_available_enemy",
+                    "expedition_available_enemy_right",
+                    "expedition_challenge",
+                    "expedition_force_challenge_confirm",
+                )
+            )
+        self._require_template_files(tuple(template_names))
         primary_error: Optional[BaseException] = None
         try:
             self.click_template("home_challenge_mode")
@@ -1556,8 +2186,18 @@ class DailyFlowRunner:
                 required=False,
                 tap_delay=2.5,
             )
+            if (
+                not entry.found
+                and bool(DEEP_SPACE_CRUISE_CONFIG["complete_normal_cruise"])
+                and self._complete_normal_cruise()
+            ):
+                entry = self.click_template(
+                    "deep_space_cruise_entry",
+                    required=False,
+                    tap_delay=2.5,
+                )
             if not entry.found:
-                logging.warning("深空巡航：本期普通星域巡航尚未完成，入口未解锁，安全跳过")
+                logging.warning("深空巡航：普通星域巡航未完成或入口未解锁，安全跳过")
             else:
                 # 账号首次进入时会自动弹出规则页；只关闭已识别到的弹窗。
                 self.click_template(
@@ -1592,6 +2232,213 @@ class DailyFlowRunner:
             raise ValueError(f"未知超限模式空间站: {board}")
         return names[board]
 
+    @staticmethod
+    def _validate_overlimit_max_trial_config(config: dict) -> None:
+        """校验 MAX 试用的付费边界，保证配置错误在首次点击前失败。"""
+        if not bool(config.get("use_max_equipment_trial", False)):
+            return
+        if int(config["max_equipment_trial_expected_cost"]) != 200:
+            raise ValueError("MAX 装备试用只允许精确价格 200 钻")
+
+        confidence = float(config["max_equipment_trial_min_confidence"])
+        if not 0.0 < confidence <= 1.0:
+            raise ValueError("MAX 装备试用 OCR 置信度必须在 (0, 1] 内")
+        if int(config["max_equipment_trial_confirm_frames"]) < 2:
+            raise ValueError("MAX 装备试用至少需要连续两帧确认")
+        if float(config["max_equipment_trial_poll_seconds"]) <= 0:
+            raise ValueError("MAX 装备试用轮询间隔必须大于 0")
+        if float(config["max_equipment_trial_confirm_timeout_seconds"]) <= 0:
+            raise ValueError("MAX 装备试用确认超时必须大于 0")
+        if float(config["max_equipment_trial_point_tolerance"]) < 0:
+            raise ValueError("MAX 装备试用坐标容差不能小于 0")
+        purchase_attempt_limit = int(
+            config["max_equipment_trial_purchase_attempt_limit"]
+        )
+        if not 1 <= purchase_attempt_limit <= 16:
+            raise ValueError("MAX 装备试用购买尝试上限必须在 1..16 内")
+
+        for key in (
+            "max_equipment_trial_label_roi",
+            "max_equipment_trial_cost_roi",
+            "max_equipment_trial_prompt_roi",
+        ):
+            roi = tuple(int(value) for value in config[key])
+            if len(roi) != 4:
+                raise ValueError(f"MAX 装备试用 {key} 必须是四元区域")
+            x1, y1, x2, y2 = roi
+            if not (
+                0 <= x1 < x2 <= TARGET_CLIENT_WIDTH
+                and 0 <= y1 < y2 <= TARGET_CLIENT_HEIGHT
+            ):
+                raise ValueError(f"MAX 装备试用 {key} 越界: {roi}")
+
+    def _read_overlimit_max_trial_state(
+        self,
+        shot: Path,
+    ) -> tuple[Optional[str], Optional[tuple[float, float]]]:
+        """识别 MAX 试用弹窗：available 可购买，activated 已启用。
+
+        付费态必须同帧确认弹窗标题、主挑战按钮、完整 MAX 说明与
+        唯一精确价格 200；已启用态必须识别到完整的装备战斗提示。
+        """
+        config = OVERLIMIT_MODE_CONFIG
+        if not self.match("overlimit_mode_overlimit_dialog", shot).found:
+            return None, None
+        if not self.match("overlimit_mode_start_challenge", shot).found:
+            return None, None
+
+        minimum_confidence = float(config["max_equipment_trial_min_confidence"])
+
+        def read_tokens(
+            key: str,
+        ) -> list[tuple[str, float, float, float]]:
+            return [
+                (text.replace(" ", ""), confidence, x, y)
+                for text, confidence, x, y in self._read_ocr_tokens(
+                    shot,
+                    tuple(int(value) for value in config[key]),
+                )
+            ]
+
+        def trusted_tokens(
+            tokens: list[tuple[str, float, float, float]],
+        ) -> list[tuple[str, float, float, float]]:
+            return [
+                token for token in tokens if token[1] >= minimum_confidence
+            ]
+
+        label_tokens = trusted_tokens(
+            read_tokens("max_equipment_trial_label_roi")
+        )
+        raw_cost_tokens = read_tokens("max_equipment_trial_cost_roi")
+        cost_tokens = trusted_tokens(raw_cost_tokens)
+        prompt_tokens = trusted_tokens(
+            read_tokens("max_equipment_trial_prompt_roi")
+        )
+        label_text = "".join(text for text, *_rest in label_tokens).upper()
+        prompt_text = "".join(text for text, *_rest in prompt_tokens)
+
+        numeric_tokens: list[tuple[int, float, float]] = []
+        for text, _confidence, x, y in cost_tokens:
+            for match in re.finditer(r"(?<!\d)(\d+)(?!\d)", text):
+                numeric_tokens.append((int(match.group(1)), x, y))
+        raw_cost_numbers = [
+            int(match.group(1))
+            for text, _confidence, _x, _y in raw_cost_tokens
+            for match in re.finditer(r"(?<!\d)(\d+)(?!\d)", text)
+        ]
+
+        active_prompt_parts = (
+            "将以所拥有",
+            "超限挑战装备",
+            "进行战斗",
+            "是否开始挑战",
+        )
+        expected_cost = int(config["max_equipment_trial_expected_cost"])
+        if (
+            all(part in prompt_text for part in active_prompt_parts)
+            and not raw_cost_numbers
+        ):
+            return "activated", None
+
+        available_label_parts = ("试用", "MAX", "装备", "试用不进入排行榜单")
+        if not all(part in label_text for part in available_label_parts):
+            return None, None
+        if len(numeric_tokens) != 1 or numeric_tokens[0][0] != expected_cost:
+            return None, None
+
+        _cost, x, y = numeric_tokens[0]
+        x1, y1, x2, y2 = (
+            int(value) for value in config["max_equipment_trial_cost_roi"]
+        )
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            return None, None
+        return "available", (x, y)
+
+    def _activate_overlimit_max_trial(self, *, context: str) -> bool:
+        """双帧确认后最多点击一次 200 钻，再双帧确认 MAX 已启用。"""
+        config = OVERLIMIT_MODE_CONFIG
+        if not bool(config.get("use_max_equipment_trial", False)):
+            return True
+
+        required_frames = int(config["max_equipment_trial_confirm_frames"])
+        poll_seconds = float(config["max_equipment_trial_poll_seconds"])
+        first_shot = self.wait_until_not_loading(settle_seconds=0.3)
+        confirm_timeout = float(config["max_equipment_trial_confirm_timeout_seconds"])
+        deadline = time.monotonic() + confirm_timeout
+        observed_state: Optional[str] = None
+        purchase_points: list[tuple[float, float]] = []
+
+        for frame_index in range(required_frames):
+            if frame_index:
+                if not self._sleep_with_deadline(poll_seconds, deadline):
+                    return False
+                shot = self.screenshot(f"{context}_max_precheck_{frame_index + 1}")
+            else:
+                shot = first_shot
+            state, point = self._read_overlimit_max_trial_state(shot)
+            if state not in {"available", "activated"}:
+                logging.warning("%s：MAX 弹窗第%d帧状态不可信", context, frame_index + 1)
+                return False
+            if observed_state is None:
+                observed_state = state
+            elif state != observed_state:
+                logging.warning("%s：MAX 弹窗连续帧状态不一致", context)
+                return False
+            if state == "available":
+                if point is None:
+                    return False
+                purchase_points.append(point)
+
+        if observed_state == "activated":
+            logging.info("%s：MAX 装备已启用，不重复购买", context)
+            return True
+        if observed_state != "available" or len(purchase_points) != required_frames:
+            return False
+
+        tolerance = float(config["max_equipment_trial_point_tolerance"])
+        anchor_x, anchor_y = purchase_points[0]
+        if any(
+            (x - anchor_x) ** 2 + (y - anchor_y) ** 2 > tolerance**2
+            for x, y in purchase_points[1:]
+        ):
+            logging.warning("%s：MAX 价格坐标连续帧不一致，拒绝购买", context)
+            return False
+
+        purchase_limit = int(config["max_equipment_trial_purchase_attempt_limit"])
+        if self.overlimit_max_trial_purchase_attempts >= purchase_limit:
+            logging.error("%s：MAX 购买尝试已达本次流程上限%d", context, purchase_limit)
+            return False
+
+        purchase_x, purchase_y = purchase_points[-1]
+        self.overlimit_max_trial_purchase_attempts += 1
+        logging.info(
+            "%s：双帧确认唯一价格200，第%d/%d次点击 MAX 试用",
+            context,
+            self.overlimit_max_trial_purchase_attempts,
+            purchase_limit,
+        )
+        # 点击会直接扣除 200 钻，不存在二次确认；本方法内绝不重试。
+        self.ctrl.tap(purchase_x, purchase_y, delay=1.5)
+
+        activated_frames = 0
+        deadline = time.monotonic() + confirm_timeout
+        while time.monotonic() < deadline:
+            shot = self.screenshot(f"{context}_max_activation")
+            state, _point = self._read_overlimit_max_trial_state(shot)
+            if state == "activated":
+                activated_frames += 1
+                if activated_frames >= required_frames:
+                    logging.info("%s：已连续%d帧确认 MAX 装备启用", context, required_frames)
+                    return True
+            else:
+                activated_frames = 0
+            if not self._sleep_with_deadline(poll_seconds, deadline):
+                break
+
+        # 既然已经发生过一次付费点击，状态不明时必须停掉整个流程。
+        raise RuntimeError(f"{context}：已点击200钻 MAX，但未能确认启用，拒绝再次扣费")
+
     def _wait_for_overlimit_battle_start(
         self,
         *,
@@ -1605,6 +2452,7 @@ class DailyFlowRunner:
             raise ValueError("超限模式战斗启动等待时间必须大于 0")
         deadline = time.monotonic() + timeout
         force_confirm_clicked = False
+        crystal_continue_clicked = False
         partial_crystal_logged = False
         while time.monotonic() < deadline:
             shot = self.screenshot(f"{context}_start_poll")
@@ -1616,10 +2464,14 @@ class DailyFlowRunner:
                 crystal_invalid = self.match("overlimit_mode_crystal_invalid", shot)
                 continue_battle = self.match("overlimit_mode_continue_battle", shot)
                 if crystal_invalid.found and continue_battle.found:
-                    logging.info("%s：预设包含失效原晶，按当前预设继续", context)
-                    # 同一截图同时确认标题和按钮后才允许点击，避开下方付费试用区。
-                    self.ctrl.tap(continue_battle.x, continue_battle.y, delay=3.0)
-                    return True
+                    if not crystal_continue_clicked:
+                        logging.info("%s：预设包含失效原晶，按当前预设继续", context)
+                        # 同一截图同时确认标题和按钮后才允许点击，避开下方付费试用区。
+                        self.ctrl.tap(continue_battle.x, continue_battle.y, delay=3.0)
+                        crystal_continue_clicked = True
+                    if not self._sleep_with_deadline(0.2, deadline):
+                        break
+                    continue
                 if (crystal_invalid.found or continue_battle.found) and not partial_crystal_logged:
                     logging.warning("%s：原晶弹窗尚未完整渲染，继续等待", context)
                     partial_crystal_logged = True
@@ -1669,7 +2521,12 @@ class DailyFlowRunner:
                 return False
         else:
             self.recognize_template("overlimit_mode_overlimit_dialog")
-            # 只点击主挑战按钮；不触碰下方需消耗资源的 MAX 装备试用。
+            if (
+                bool(OVERLIMIT_MODE_CONFIG.get("use_max_equipment_trial", False))
+                and not self._activate_overlimit_max_trial(context=context)
+            ):
+                logging.warning("%s：未能安全确认 MAX 购买条件，不启动挑战", context)
+                return False
             self.click_template("overlimit_mode_start_challenge", tap_delay=2.0)
             if not self._wait_for_overlimit_battle_start(
                 context=context,
@@ -1687,6 +2544,7 @@ class DailyFlowRunner:
             timeout=float(OVERLIMIT_MODE_CONFIG["battle_timeout_seconds"]),
             revive_by_ad=bool(OVERLIMIT_MODE_CONFIG["revive_by_ad"]),
             defeat_template="cruise_result_defeat",
+            battle_assist_config=BATTLE_ASSIST_CONFIG,
         )
         logging.info("%s：结算结果=%s", context, battle_result.value)
         if battle_result is BattleResult.DEFEAT:
@@ -1694,12 +2552,27 @@ class DailyFlowRunner:
             return False
         if battle_result is BattleResult.COMPLETE:
             logging.warning(
-                "%s：未识别胜负，后续仅允许由稳定完成槽位增长确认进度",
+                "%s：未识别胜负，后续仅允许由挑战标题状态变化确认进度",
                 context,
             )
-        self.recognize_template("overlimit_mode_stage_page")
+        self._recognize_overlimit_stage_page()
         logging.info("%s：完成", context)
         return True
+
+    def _recognize_overlimit_stage_page(self, required: bool = True) -> bool:
+        """用稳定按钮确认挑战详情页，避免把动态 BOSS 名称当成整页标志。"""
+        shot = self.wait_until_not_loading(settle_seconds=0.4)
+        marker_names = (
+            "overlimit_mode_normal_challenge",
+            "overlimit_mode_overlimit_challenge",
+            "overlimit_mode_normal_cleared",
+            "overlimit_mode_stage_page",
+        )
+        if any(self.match(name, shot).found for name in marker_names):
+            return True
+        if required:
+            raise RuntimeError("超限模式：未确认进入空间站挑战详情页")
+        return False
 
     @staticmethod
     def _overlimit_board_count_roi(board: str) -> tuple[int, int, int, int]:
@@ -1722,6 +2595,127 @@ class DailyFlowRunner:
         except ImportError:
             return None
         return RapidOCR()
+
+    @classmethod
+    def _read_ocr_tokens(
+        cls,
+        screenshot_path: Path,
+        roi: tuple[int, int, int, int],
+    ) -> list[tuple[str, float, float, float]]:
+        """返回 ROI 内 OCR 文本、置信度及相对整张截图的文本框中心。"""
+        engine = cls._get_ocr_engine()
+        if engine is None:
+            return []
+        image = TemplateMatcher._read_image(screenshot_path, grayscale=False)
+        x1, y1, x2, y2 = (int(value) for value in roi)
+        height, width = image.shape[:2]
+        if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+            return []
+        result, _ = engine(image[y1:y2, x1:x2])
+        tokens: list[tuple[str, float, float, float]] = []
+        for item in result or []:
+            if len(item) < 2:
+                continue
+            try:
+                confidence = float(item[2]) if len(item) > 2 else 0.0
+            except (TypeError, ValueError):
+                continue
+            box = item[0]
+            try:
+                xs = [float(point[0]) for point in box]
+                ys = [float(point[1]) for point in box]
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not xs or not ys:
+                continue
+            tokens.append(
+                (
+                    str(item[1]).replace(" ", ""),
+                    confidence,
+                    x1 + sum(xs) / len(xs),
+                    y1 + sum(ys) / len(ys),
+                )
+            )
+        return tokens
+
+    @classmethod
+    def _read_overlimit_stage_header(cls, screenshot_path: Path) -> str:
+        """读取 BOSS 标题旁的未完成、普通通关或超限通关状态。"""
+        engine = cls._get_ocr_engine()
+        if engine is None:
+            return ""
+        image = TemplateMatcher._read_image(screenshot_path, grayscale=False)
+        x1, y1, x2, y2 = (
+            int(value) for value in OVERLIMIT_MODE_CONFIG["stage_header_roi"]
+        )
+        height, width = image.shape[:2]
+        if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+            return ""
+        result, _ = engine(image[y1:y2, x1:x2])
+        texts: list[str] = []
+        for item in result or []:
+            if len(item) < 2:
+                continue
+            try:
+                confidence = float(item[2]) if len(item) > 2 else 0.0
+            except (TypeError, ValueError):
+                continue
+            if confidence >= 0.65:
+                texts.append(str(item[1]).replace(" ", ""))
+        return "".join(texts)
+
+    def _get_overlimit_stage_status(self, shot: Optional[Path] = None) -> Optional[str]:
+        """返回 incomplete/normal_cleared/overlimit_cleared/ended；未知则返回 None。"""
+        current = shot or self.screenshot("overlimit_stage_status")
+        if self.match("overlimit_mode_challenge_ended", current).found:
+            return "ended"
+
+        header = self._read_overlimit_stage_header(current)
+        if "超限通关" in header:
+            return "overlimit_cleared"
+        if "普通通关" in header:
+            return "normal_cleared"
+        if "未完成挑战" in header:
+            return "incomplete"
+
+        if self.match("overlimit_mode_normal_cleared", current).found:
+            return "normal_cleared"
+        if self.match("overlimit_mode_stage_page", current).found:
+            return "incomplete"
+        logging.warning("超限模式：无法确认当前 BOSS 完成状态，标题 OCR=%r", header)
+        return None
+
+    def _rewind_overlimit_stages(self) -> bool:
+        """回到第一个 BOSS，确保部分完成时也从稳定顺序扫描。"""
+        stages = int(OVERLIMIT_MODE_CONFIG["stages_per_board"])
+        for _ in range(max(0, stages - 1)):
+            previous = self.click_template(
+                "overlimit_mode_stage_prev",
+                required=False,
+                tap_delay=0.8,
+                settle_seconds=0.2,
+            )
+            if not previous.found:
+                return True
+            if not self._recognize_overlimit_stage_page(required=False):
+                return False
+        # 第六次仍有左箭头意味着页码没有变化，停止避免死循环。
+        return not self.recognize_template(
+            "overlimit_mode_stage_prev",
+            required=False,
+            settle_seconds=0.2,
+        ).found
+
+    def _advance_overlimit_stage(self) -> bool:
+        next_stage = self.click_template(
+            "overlimit_mode_stage_next",
+            required=False,
+            tap_delay=0.8,
+            settle_seconds=0.2,
+        )
+        if not next_stage.found:
+            return False
+        return self._recognize_overlimit_stage_page(required=False)
 
     @classmethod
     def _read_challenge_count_from_image(
@@ -1828,11 +2822,7 @@ class DailyFlowRunner:
             settle_seconds=0.2,
         ).found:
             return True
-        if not self.recognize_template(
-            "overlimit_mode_stage_page",
-            required=False,
-            settle_seconds=0.2,
-        ).found:
+        if not self._recognize_overlimit_stage_page(required=False):
             return False
         if not self.click_template("back", required=False, tap_delay=1.5).found:
             return False
@@ -1847,7 +2837,7 @@ class DailyFlowRunner:
         board: str,
         count_before: Optional[int] = None,
     ) -> Optional[int]:
-        """按聚合完成槽位计数逐轮处理一个空间站，未增长时立即停止。"""
+        """顺序扫描 6 个 BOSS，按标题状态补齐普通和超限两个完成槽位。"""
         board_name = self._overlimit_board_name(board)
         target_runs = int(OVERLIMIT_MODE_CONFIG["target_runs_per_board"])
         if target_runs < 0 or target_runs > 12:
@@ -1868,65 +2858,110 @@ class DailyFlowRunner:
             )
             return count_before
 
-        current_count = count_before
+        stages = int(OVERLIMIT_MODE_CONFIG["stages_per_board"])
+        if stages < 1 or target_runs > stages * 2:
+            raise ValueError("OVERLIMIT_MODE_CONFIG.stages_per_board 与目标槽位不匹配")
+
+        expected_count = count_before
         stage_open = False
         primary_error: Optional[BaseException] = None
         try:
-            while current_count < target_runs:
-                if not stage_open:
-                    entry = self.click_template(
-                        f"overlimit_mode_board_{board}",
-                        required=False,
-                        tap_delay=2.0,
-                    )
-                    if not entry.found:
-                        logging.info("超限模式：未识别到%s空间站，跳过", board_name)
-                        return current_count
-                    if not self.recognize_template("overlimit_mode_stage_page").found:
-                        return current_count
-                    stage_open = True
+            entry = self.click_template(
+                f"overlimit_mode_board_{board}",
+                required=False,
+                tap_delay=2.0,
+            )
+            if not entry.found:
+                logging.info("超限模式：未识别到%s空间站，跳过", board_name)
+                return expected_count
+            if not self._recognize_overlimit_stage_page(required=False):
+                return expected_count
+            stage_open = True
+            if not self._rewind_overlimit_stages():
+                logging.warning("超限模式%s：无法回到第一个 BOSS，停止本站", board_name)
+                return expected_count
 
-                normal_cleared = self.recognize_template(
-                    "overlimit_mode_normal_cleared",
-                    required=False,
-                    settle_seconds=0.2,
-                ).found
-                if normal_cleared:
-                    logging.info("超限模式%s空间站：普通挑战已通关", board_name)
-                    challenge = "overlimit"
-                    if not bool(OVERLIMIT_MODE_CONFIG["run_overlimit_challenge"]):
-                        logging.info("超限模式%s：已关闭超限挑战，停止", board_name)
-                        return current_count
-                else:
-                    challenge = "normal"
-                    if not bool(OVERLIMIT_MODE_CONFIG["run_normal_challenge"]):
+            stop_board = False
+            for stage_index in range(1, stages + 1):
+                logging.info("超限模式%s：检查第%d/%d个 BOSS", board_name, stage_index, stages)
+                attempts = 0
+                while expected_count < target_runs and attempts < 2:
+                    status_shot = self.wait_until_not_loading(settle_seconds=0.3)
+                    status = self._get_overlimit_stage_status(status_shot)
+                    if status == "ended":
+                        logging.warning("超限模式%s：活动挑战已截止", board_name)
+                        stop_board = True
+                        break
+                    if status is None:
+                        stop_board = True
+                        break
+                    if status == "overlimit_cleared":
+                        break
+                    if status == "normal_cleared":
+                        if not bool(OVERLIMIT_MODE_CONFIG["run_overlimit_challenge"]):
+                            logging.info("超限模式%s：已关闭超限挑战，跳过当前 BOSS", board_name)
+                            break
+                        challenge = "overlimit"
+                        expected_statuses = {"overlimit_cleared"}
+                    else:
+                        if not bool(OVERLIMIT_MODE_CONFIG["run_normal_challenge"]):
+                            logging.info("超限模式%s：已关闭普通挑战，跳过当前 BOSS", board_name)
+                            break
+                        challenge = "normal"
+                        expected_statuses = {"normal_cleared", "overlimit_cleared"}
+
+                    if not self._run_overlimit_battle(board=board, challenge=challenge):
                         logging.warning(
-                            "超限模式%s空间站：普通挑战未通关且已关闭普通挑战，停止",
+                            "超限模式%s：%s未能完成，停止本站后续挑战",
                             board_name,
+                            challenge,
                         )
-                        return current_count
+                        stop_board = True
+                        break
 
-                if not self._run_overlimit_battle(board=board, challenge=challenge):
-                    logging.warning("超限模式%s：%s未能启动，停止本站后续挑战", board_name, challenge)
-                    return current_count
+                    post_shot = self.wait_until_not_loading(settle_seconds=0.3)
+                    post_status = self._get_overlimit_stage_status(post_shot)
+                    if post_status not in expected_statuses:
+                        logging.warning(
+                            "超限模式%s：%s后状态未按预期变化（%s），停止避免重复挑战",
+                            board_name,
+                            challenge,
+                            post_status,
+                        )
+                        stop_board = True
+                        break
+                    expected_count += 1
+                    attempts += 1
 
-                if not self._return_to_overlimit_board_page():
-                    raise RuntimeError(
-                        f"超限模式{board_name}：战斗后未能确认回到空间站选择页"
+                if stop_board or expected_count >= target_runs:
+                    break
+                if stage_index == stages:
+                    break
+                if not self._advance_overlimit_stage():
+                    logging.warning(
+                        "超限模式%s：第%d个 BOSS 后未找到下一页，停止本站",
+                        board_name,
+                        stage_index,
                     )
-                stage_open = False
-                count_after = self._get_overlimit_board_count(board)
-                if count_after is None:
-                    logging.warning("超限模式%s：战斗后无法确认完成槽位变化，停止", board_name)
-                    return current_count
-                if count_after < current_count:
-                    raise RuntimeError(f"超限模式{board_name}：挑战次数异常回退")
-                if count_after == current_count:
-                    logging.warning("超限模式%s：本轮完成槽位未增加，停止避免重复消耗", board_name)
-                    return current_count
-                current_count = count_after
+                    break
 
-            return current_count
+            if not self._return_to_overlimit_board_page():
+                raise RuntimeError(f"超限模式{board_name}：未能确认回到空间站选择页")
+            stage_open = False
+            count_after = self._get_overlimit_board_count(board)
+            if count_after is None:
+                logging.warning("超限模式%s：无法复核最终完成槽位，保留原始计数", board_name)
+                return count_before
+            if count_after < count_before:
+                raise RuntimeError(f"超限模式{board_name}：挑战次数异常回退")
+            if count_after < expected_count:
+                logging.warning(
+                    "超限模式%s：页面状态预计完成%d，但聚合计数仅为%d",
+                    board_name,
+                    expected_count,
+                    count_after,
+                )
+            return count_after
         except BaseException as exc:
             primary_error = exc
             raise
@@ -1956,12 +2991,18 @@ class DailyFlowRunner:
     def run_overlimit_mode_flow(self) -> None:
         logging.info("========== 超限模式流程开始 ==========")
         self._validate_battle_wait_config(OVERLIMIT_MODE_CONFIG, "超限模式")
+        self._validate_battle_assist_config(BATTLE_ASSIST_CONFIG)
+        self._validate_overlimit_max_trial_config(OVERLIMIT_MODE_CONFIG)
+        self.overlimit_max_trial_purchase_attempts = 0
         target_runs = int(OVERLIMIT_MODE_CONFIG["target_runs_per_board"])
         if target_runs < 0 or target_runs > 12:
             raise ValueError("OVERLIMIT_MODE_CONFIG.target_runs_per_board 必须在 0..12")
         if target_runs == 0:
             logging.info("超限模式：目标完成槽位为0，跳过全部挑战")
             return
+        stages = int(OVERLIMIT_MODE_CONFIG["stages_per_board"])
+        if stages < 1 or target_runs > stages * 2:
+            raise ValueError("OVERLIMIT_MODE_CONFIG.stages_per_board 与目标槽位不匹配")
         boards = tuple(str(board) for board in OVERLIMIT_MODE_CONFIG["boards"])
         for board in boards:
             self._overlimit_board_name(board)
@@ -1972,8 +3013,12 @@ class DailyFlowRunner:
             "boss_mode_overlimit_entry",
             "overlimit_mode_page",
             "overlimit_mode_stage_page",
+            "overlimit_mode_stage_prev",
+            "overlimit_mode_stage_next",
             "overlimit_mode_normal_cleared",
             "overlimit_mode_challenge_ended",
+            "overlimit_mode_normal_challenge",
+            "overlimit_mode_overlimit_challenge",
             "overlimit_mode_result_continue",
             "cruise_result_defeat",
             "overlimit_mode_ad_revive",
@@ -1989,14 +3034,12 @@ class DailyFlowRunner:
         if bool(OVERLIMIT_MODE_CONFIG["run_normal_challenge"]):
             template_names.extend(
                 (
-                    "overlimit_mode_normal_challenge",
                     "expedition_force_challenge_confirm",
                 )
             )
         if bool(OVERLIMIT_MODE_CONFIG["run_overlimit_challenge"]):
             template_names.extend(
                 (
-                    "overlimit_mode_overlimit_challenge",
                     "overlimit_mode_overlimit_dialog",
                     "overlimit_mode_start_challenge",
                     "overlimit_mode_crystal_invalid",
